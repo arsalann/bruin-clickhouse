@@ -13,7 +13,7 @@ environments:
                 - name: github
                   access_token: ${GITHUB_TOKEN}
                   owner: arsalann
-                  repo: bruin-clickhouse
+                  repo: bruin-clickhouse-101
             bruin:
                 - name: bruin-cloud
                   api_token: ${BRUIN_CLOUD_API_TOKEN}
