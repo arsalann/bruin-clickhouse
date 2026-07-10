@@ -219,6 +219,7 @@ __marimo__/
 
 # Bruin
 .bruin/
+.bruin.yml
 
 # ClickHouse
 data/
