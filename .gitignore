@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Bruin
+.bruin/
+
+# ClickHouse
+data/
+logs/
+
+# Local development
+.archive/
