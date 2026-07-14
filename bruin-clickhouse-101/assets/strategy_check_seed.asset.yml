@@ -1,0 +1,16 @@
+name: strategy_check_seed
+type: clickhouse.seed
+
+parameters:
+  path: strategy_check_seed.csv
+
+columns:
+  - name: updated_at
+    type: timestamp
+    description: "UTC timestamp when the strategy value was updated."
+  - name: name
+    type: varchar
+    description: "Name of the strategy being checked."
+  - name: value
+    type: float
+    description: "Numeric value recorded for the strategy."
