@@ -227,3 +227,9 @@ logs/
 
 # Local development
 .archive/
+
+.bruin.yml.sample
+logs/queries
+logs/runs
+*.py[cod]
+logs/*.log

@@ -1,49 +1,77 @@
 /* @bruin
-name: shop_stg_customers
+name: bruin_shop.t2_customers
 type: clickhouse.sql
+description: "T2 customer dimension enriched with lifecycle and lifetime-value metrics."
 materialization:
    type: table
+   strategy: truncate+insert
 depends:
-    - shop_raw_customers
-    - shop_stg_orders
+    - bruin_shop.t1_customers
+    - bruin_shop.t2_orders
 
+custom_checks:
+  - name: contains rows
+    description: Ensures the materialized table is not empty.
+    query: SELECT count() > 0 FROM bruin_shop.t2_customers
+    value: 1
+    blocking: true
 columns:
   - name: customer_id
     type: integer
+    description: "Stable identifier of the customer."
     primary_key: true
     checks:
         - name: not_null
         - name: unique
   - name: customer_email
     type: varchar
+    description: "Email address associated with the customer or order."
   - name: customer_name
     type: varchar
+    description: "Display name of the customer."
   - name: market_id
     type: varchar
+    description: "Identifier of the market."
   - name: state
     type: varchar
+    description: "State associated with the market or customer."
   - name: city
     type: varchar
+    description: "City associated with the market or customer."
   - name: acquisition_channel
     type: varchar
+    description: "Marketing channel credited with acquiring the customer."
   - name: signup_date
     type: date
+    description: "Date on which the customer signed up."
   - name: successful_order_count
     type: integer
+    description: "Number of successful orders made by the customer."
+    checks:
+      - name: non_negative
   - name: order_attempt_count
     type: integer
+    description: "Number of order attempts made by the customer."
+    checks:
+      - name: non_negative
   - name: lifetime_net_revenue
     type: float
+    description: "Customer net revenue accumulated over successful orders."
   - name: lifetime_contribution_profit
     type: float
+    description: "Customer contribution profit accumulated over successful orders."
   - name: first_order_date
     type: date
+    description: "Date of the customer\u2019s first successful order."
   - name: latest_order_date
     type: date
+    description: "Date of the customer\u2019s most recent successful order."
   - name: days_to_first_order
     type: integer
+    description: "Days between customer signup and first successful order."
   - name: lifecycle_segment
     type: varchar
+    description: "Customer lifecycle segment derived from order behavior."
 @bruin */
 
 WITH order_metrics AS (
@@ -55,7 +83,7 @@ WITH order_metrics AS (
         sum(contribution_profit) AS lifetime_contribution_profit,
         minIf(order_date, is_successful_order = 1) AS first_order_date,
         maxIf(order_date, is_successful_order = 1) AS latest_order_date
-    FROM shop_stg_orders
+    FROM bruin_shop.t2_orders
     GROUP BY customer_id
 )
 SELECT
@@ -81,6 +109,6 @@ SELECT
         ifNull(o.successful_order_count, 0) = 1, 'first_time',
         'prospect'
     ) AS lifecycle_segment
-FROM shop_raw_customers AS c
+FROM bruin_shop.t1_customers AS c
 LEFT JOIN order_metrics AS o
     ON c.customer_id = o.customer_id

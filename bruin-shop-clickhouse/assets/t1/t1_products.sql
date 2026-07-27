@@ -1,32 +1,54 @@
 /* @bruin
-name: shop_raw_products
+name: bruin_shop.t1_products
 type: clickhouse.sql
+description: "T1 product catalog with pricing, cost, inventory, and lifecycle attributes."
 materialization:
    type: table
 
+custom_checks:
+  - name: contains rows
+    description: Ensures the materialized table is not empty.
+    query: SELECT count() > 0 FROM bruin_shop.t1_products
+    value: 1
+    blocking: true
 columns:
   - name: product_id
     type: varchar
+    description: "Stable identifier of the product."
     primary_key: true
     checks:
         - name: not_null
         - name: unique
   - name: product_name
     type: varchar
+    description: "Display name of the product."
   - name: category
     type: varchar
+    description: "Merchandise category assigned to the product."
   - name: sku
     type: varchar
+    description: "Stock-keeping unit assigned to the product."
   - name: list_price
     type: float
+    description: "Catalog list price per product unit."
+    checks:
+      - name: positive
   - name: unit_cogs
     type: float
+    description: "Cost of goods sold per product unit."
+    checks:
+      - name: non_negative
   - name: inventory_on_hand
     type: integer
+    description: "Current sellable units available in inventory."
+    checks:
+      - name: non_negative
   - name: is_active
     type: integer
+    description: "Whether the product is active in the catalog."
   - name: launch_date
     type: date
+    description: "Date on which the product was launched."
 @bruin */
 
 WITH arrayJoin([

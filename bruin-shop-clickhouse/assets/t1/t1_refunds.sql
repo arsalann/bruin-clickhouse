@@ -1,31 +1,49 @@
 /* @bruin
-name: shop_raw_refunds
+name: bruin_shop.t1_refunds
 type: clickhouse.sql
+description: "T1 refund records associated with payment intents and orders."
 materialization:
    type: table
+   strategy: append
 depends:
-    - shop_raw_orders
-    - shop_raw_payment_intents
+    - bruin_shop.t1_orders
+    - bruin_shop.t1_payment_intents
+    - bruin_shop.t1_refunds_delete_interval
 
+custom_checks:
+  - name: contains rows
+    description: Ensures the materialized table is not empty.
+    query: SELECT count() > 0 FROM bruin_shop.t1_refunds
+    value: 1
+    blocking: true
 columns:
   - name: refund_id
     type: varchar
+    description: "Stable identifier of the refund."
     primary_key: true
     checks:
         - name: not_null
         - name: unique
   - name: payment_intent_id
     type: varchar
+    description: "Stable identifier of the payment intent."
   - name: order_id
     type: integer
+    description: "Stable identifier of the order attempt."
   - name: customer_id
     type: integer
+    description: "Stable identifier of the customer."
   - name: refund_created_at
     type: datetime
+    description: "Timestamp when the refund was created."
   - name: refund_amount
     type: float
+    description: "Monetary value refunded to the customer."
+    checks:
+      - name: non_negative
   - name: refund_reason
     type: varchar
+    description: "Reason assigned to the refund."
 @bruin */
 
 SELECT
@@ -47,7 +65,9 @@ SELECT
         o.order_status = 'refunded', 'customer_return',
         'goodwill_partial_refund'
     ) AS refund_reason
-FROM shop_raw_orders AS o
-INNER JOIN shop_raw_payment_intents AS p
+FROM bruin_shop.t1_orders AS o
+INNER JOIN bruin_shop.t1_payment_intents AS p
     ON o.order_id = p.order_id
 WHERE o.order_status IN ('refunded', 'partially_refunded')
+    AND o.order_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
+SETTINGS insert_deduplicate = 0

@@ -1,48 +1,88 @@
 /* @bruin
-name: shop_raw_marketing_spend
+name: bruin_shop.t1_marketing_spend
 type: clickhouse.sql
+description: "T1 daily marketing spend, delivery, and campaign attribution by market and channel."
 materialization:
    type: table
+   strategy: append
 depends:
-    - shop_raw_markets
-    - shop_raw_special_events
+    - bruin_shop.t1_markets
+    - bruin_shop.t1_special_events
+    - bruin_shop.t1_marketing_spend_delete_interval
 
+custom_checks:
+  - name: contains rows
+    description: Ensures the materialized table is not empty.
+    query: SELECT count() > 0 FROM bruin_shop.t1_marketing_spend
+    value: 1
+    blocking: true
+  - name: marketing spend grain is unique
+    description: Ensures there is at most one spend row per date, market, channel, event, and campaign.
+    query: |
+      SELECT spend_date, market_id, channel, event_id, campaign_id
+      FROM bruin_shop.t1_marketing_spend
+      GROUP BY spend_date, market_id, channel, event_id, campaign_id
+      HAVING count() > 1
+    count: 0
+    blocking: true
 columns:
   - name: spend_id
     type: varchar
+    description: "Stable identifier of the marketing-spend grain."
     primary_key: true
     checks:
         - name: not_null
         - name: unique
   - name: spend_date
     type: date
+    description: "Calendar date on which the marketing spend occurred."
   - name: market_id
     type: varchar
+    description: "Identifier of the market."
   - name: market_index
     type: integer
+    description: "Stable numeric ordering of the market."
   - name: state
     type: varchar
+    description: "State associated with the market or customer."
   - name: city
     type: varchar
+    description: "City associated with the market or customer."
   - name: channel
     type: varchar
+    description: "Marketing or acquisition channel associated with the record."
+    checks:
+      - name: accepted_values
+        value: ["direct", "email", "organic", "paid_search", "paid_social"]
   - name: event_id
     type: varchar
+    description: "Identifier of the associated special event."
   - name: campaign_id
     type: varchar
+    description: "Identifier of the marketing campaign associated with the record."
   - name: campaign_name
     type: varchar
+    description: "Human-readable name of the associated marketing campaign."
   - name: impressions
     type: integer
+    description: "Number of advertising or campaign impressions."
+    checks:
+      - name: non_negative
   - name: clicks
     type: integer
+    description: "Number of advertising or campaign clicks."
+    checks:
+      - name: non_negative
   - name: spend_amount
     type: float
+    description: "Marketing spend amount."
+    checks:
+      - name: non_negative
 @bruin */
 
 WITH
-    toDate('2026-01-01') AS start_date,
-    toDate('2026-06-30') AS end_date,
+    toDate('{{ start_date }}') AS start_date,
+    toDate('{{ end_date }}') AS end_date,
     date_spine AS (
         SELECT addDays(start_date, toUInt16(number)) AS spend_date
         FROM numbers(dateDiff('day', start_date, end_date) + 1)
@@ -125,9 +165,9 @@ WITH
                 0.00
             ) * m.demand_weight AS base_spend
         FROM date_spine AS d
-        CROSS JOIN shop_raw_markets AS m
+        CROSS JOIN bruin_shop.t1_markets AS m
         CROSS JOIN channels AS c
-        CROSS JOIN (SELECT count() AS event_catalog_rows FROM shop_raw_special_events) AS event_catalog
+        CROSS JOIN (SELECT count() AS event_catalog_rows FROM bruin_shop.t1_special_events) AS event_catalog
     )
 SELECT
     concat(toString(spend_date), '_', market_id, '_', channel) AS spend_id,
@@ -151,3 +191,4 @@ SELECT
     toUInt64(round(base_impressions * spend_multiplier * base_ctr * least(conversion_multiplier, 1.25))) AS clicks,
     round(base_spend * spend_multiplier, 2) AS spend_amount
 FROM base
+SETTINGS insert_deduplicate = 0

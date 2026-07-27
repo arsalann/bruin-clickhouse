@@ -1,38 +1,56 @@
 /* @bruin
-name: shop_raw_customers
+name: bruin_shop.t1_customers
 type: clickhouse.sql
+description: "T1 customer dimension with identity, geography, acquisition, and signup attributes."
 materialization:
    type: table
 depends:
-    - shop_raw_markets
+    - bruin_shop.t1_markets
 
+custom_checks:
+  - name: contains rows
+    description: Ensures the materialized table is not empty.
+    query: SELECT count() > 0 FROM bruin_shop.t1_customers
+    value: 1
+    blocking: true
 columns:
   - name: customer_id
     type: integer
+    description: "Stable identifier of the customer."
     primary_key: true
     checks:
         - name: not_null
         - name: unique
   - name: customer_email
     type: varchar
+    description: "Email address associated with the customer or order."
   - name: first_name
     type: varchar
+    description: "Given name of the customer."
   - name: last_name
     type: varchar
+    description: "Family name of the customer."
   - name: customer_name
     type: varchar
+    description: "Display name of the customer."
   - name: market_id
     type: varchar
+    description: "Identifier of the market."
   - name: state
     type: varchar
+    description: "State associated with the market or customer."
   - name: city
     type: varchar
+    description: "City associated with the market or customer."
   - name: acquisition_channel
     type: varchar
+    description: "Marketing channel credited with acquiring the customer."
   - name: signup_date
     type: date
+    description: "Date on which the customer signed up."
   - name: source_lifecycle_segment
     type: varchar
+    description: "Lifecycle segment assigned by the deterministic customer source."
 @bruin */
 
 WITH
@@ -52,5 +70,5 @@ SELECT
     addDays(toDate('2025-08-01'), toUInt16(cityHash64(toString(n.number), 'signup') % 210)) AS signup_date,
     multiIf(n.number % 100 < 9, 'high_intent', n.number % 100 < 34, 'repeat_candidate', 'new_prospect') AS source_lifecycle_segment
 FROM numbers(8000) AS n
-INNER JOIN shop_raw_markets AS m
+INNER JOIN bruin_shop.t1_markets AS m
     ON m.market_index = toUInt8((n.number % 12) + 1)

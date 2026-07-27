@@ -1,72 +1,133 @@
 /* @bruin
-name: shop_raw_orders
+name: bruin_shop.t1_orders
 type: clickhouse.sql
+description: "T1 deterministic ecommerce order attempts with product, customer, and financial detail."
 materialization:
    type: table
+   strategy: append
 depends:
-    - shop_raw_web_sessions
-    - shop_raw_special_events
-    - shop_raw_products
-    - shop_raw_customers
-    - shop_raw_markets
+    - bruin_shop.t1_web_sessions
+    - bruin_shop.t1_special_events
+    - bruin_shop.t1_products
+    - bruin_shop.t1_customers
+    - bruin_shop.t1_markets
+    - bruin_shop.t1_orders_delete_interval
 
+custom_checks:
+  - name: contains rows
+    description: Ensures the materialized table is not empty.
+    query: SELECT count() > 0 FROM bruin_shop.t1_orders
+    value: 1
+    blocking: true
 columns:
   - name: order_id
     type: integer
+    description: "Stable identifier of the order attempt."
     primary_key: true
     checks:
         - name: not_null
         - name: unique
   - name: order_name
     type: varchar
+    description: "Customer-facing order reference."
   - name: customer_id
     type: integer
+    description: "Stable identifier of the customer."
   - name: customer_email
     type: varchar
+    description: "Email address associated with the customer or order."
   - name: order_date
     type: date
+    description: "Calendar date on which the order was placed."
   - name: order_datetime
     type: datetime
+    description: "Timestamp at which the order was placed."
   - name: market_id
     type: varchar
+    description: "Identifier of the market."
   - name: state
     type: varchar
+    description: "State associated with the market or customer."
   - name: city
     type: varchar
+    description: "City associated with the market or customer."
   - name: channel
     type: varchar
+    description: "Marketing or acquisition channel associated with the record."
+    checks:
+      - name: accepted_values
+        value: ["direct", "email", "organic", "paid_search", "paid_social"]
   - name: event_id
     type: varchar
+    description: "Identifier of the associated special event."
   - name: campaign_id
     type: varchar
+    description: "Identifier of the marketing campaign associated with the record."
   - name: product_id
     type: varchar
+    description: "Stable identifier of the product."
   - name: product_name
     type: varchar
+    description: "Display name of the product."
   - name: product_category
     type: varchar
+    description: "Merchandise category of the ordered product."
   - name: item_count
     type: integer
+    description: "Number of units included in the order."
+    checks:
+      - name: positive
   - name: order_status
     type: varchar
+    description: "Lifecycle status assigned to the order attempt."
+    checks:
+      - name: accepted_values
+        value: ["cancelled", "paid", "partially_refunded", "refunded"]
   - name: financial_status
     type: varchar
+    description: "Payment and refund state assigned to the order."
+    checks:
+      - name: accepted_values
+        value: ["paid", "refunded", "voided"]
   - name: fulfillment_status
     type: varchar
+    description: "Fulfilment state assigned to the order."
+    checks:
+      - name: accepted_values
+        value: ["cancelled", "fulfilled", "unfulfilled"]
   - name: gross_merchandise_amount
     type: float
+    description: "Pre-discount merchandise value of the order."
   - name: discount_amount
     type: float
+    description: "Discount value applied to the order."
+    checks:
+      - name: non_negative
   - name: tax_amount
     type: float
+    description: "Tax charged on the order or period."
+    checks:
+      - name: non_negative
   - name: shipping_revenue
     type: float
+    description: "Shipping revenue charged on the order or period."
+    checks:
+      - name: non_negative
   - name: shipping_cost
     type: float
+    description: "Shipping cost incurred for the order or period."
+    checks:
+      - name: non_negative
   - name: cogs_amount
     type: float
+    description: "Cost of goods sold associated with the order or period."
+    checks:
+      - name: non_negative
   - name: total_amount
     type: float
+    description: "Final amount charged for the order."
+    checks:
+      - name: non_negative
 @bruin */
 
 WITH
@@ -112,9 +173,10 @@ WITH
                 ),
                 0
             )) AS order_count
-        FROM shop_raw_web_sessions AS s
-        LEFT JOIN shop_raw_special_events AS e
+        FROM bruin_shop.t1_web_sessions AS s
+        LEFT JOIN bruin_shop.t1_special_events AS e
             ON s.event_id = e.event_id
+        WHERE s.session_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
     ),
     exploded AS (
         SELECT
@@ -176,9 +238,9 @@ WITH
             ) AS discount_amount,
             round(p.unit_cogs * s.item_count, 2) AS cogs_amount
         FROM selected AS s
-        INNER JOIN shop_raw_products AS p
+        INNER JOIN bruin_shop.t1_products AS p
             ON s.product_id = p.product_id
-        INNER JOIN shop_raw_customers AS c
+        INNER JOIN bruin_shop.t1_customers AS c
             ON s.customer_id = c.customer_id
     )
 SELECT
@@ -214,5 +276,6 @@ SELECT
     po.cogs_amount,
     round(po.gross_merchandise_amount - po.discount_amount + tax_amount + shipping_revenue, 2) AS total_amount
 FROM priced AS po
-INNER JOIN shop_raw_markets AS m
+INNER JOIN bruin_shop.t1_markets AS m
     ON po.market_id = m.market_id
+SETTINGS insert_deduplicate = 0

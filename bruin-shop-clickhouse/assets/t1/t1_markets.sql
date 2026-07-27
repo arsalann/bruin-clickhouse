@@ -1,28 +1,48 @@
 /* @bruin
-name: shop_raw_markets
+name: bruin_shop.t1_markets
 type: clickhouse.sql
+description: "T1 market dimension with geography, demand weighting, and tax assumptions."
 materialization:
    type: table
 
+custom_checks:
+  - name: contains rows
+    description: Ensures the materialized table is not empty.
+    query: SELECT count() > 0 FROM bruin_shop.t1_markets
+    value: 1
+    blocking: true
 columns:
   - name: market_id
     type: varchar
+    description: "Identifier of the market."
     primary_key: true
     checks:
         - name: not_null
         - name: unique
   - name: market_index
     type: integer
+    description: "Stable numeric ordering of the market."
+    checks:
+      - name: positive
   - name: state
     type: varchar
+    description: "State associated with the market or customer."
   - name: city
     type: varchar
+    description: "City associated with the market or customer."
   - name: region
     type: varchar
+    description: "Geographic region containing the market."
   - name: demand_weight
     type: float
+    description: "Relative market demand factor used by the synthetic source model."
+    checks:
+      - name: positive
   - name: tax_rate
     type: float
+    description: "Tax rate applied in the market."
+    checks:
+      - name: non_negative
 @bruin */
 
 WITH arrayJoin([
