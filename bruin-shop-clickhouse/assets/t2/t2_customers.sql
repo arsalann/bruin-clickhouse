@@ -1,77 +1,127 @@
 /* @bruin
 name: bruin_shop.t2_customers
 type: clickhouse.sql
-description: "T2 customer dimension enriched with lifecycle and lifetime-value metrics."
+description: "Conformed T2 customer dimension with acquisition, lifecycle, and lifetime-value measures."
 materialization:
-   type: table
-   strategy: truncate+insert
+  type: table
+  strategy: create+replace
 depends:
-    - bruin_shop.t1_customers
-    - bruin_shop.t2_orders
+  - bruin_shop.t1_customers
+  - bruin_shop.t2_orders
+
+tags:
+  - t2
+  - conformed
+domains:
+  - commerce
+  - marketing
+meta:
+  grain: one row per customer
+  source_system: conformed_shopify
 
 custom_checks:
-  - name: contains rows
-    description: Ensures the materialized table is not empty.
-    query: SELECT count() > 0 FROM bruin_shop.t2_customers
+  - name: preserves the customer population
+    description: Ensures every source customer appears exactly once.
+    query: |
+      SELECT
+        (SELECT count() FROM bruin_shop.t2_customers)
+        =
+        (SELECT count() FROM bruin_shop.t1_customers)
     value: 1
     blocking: true
+  - name: first order follows signup
+    description: Ensures customer lifecycle dates never predate signup.
+    query: |
+      SELECT customer_id
+      FROM bruin_shop.t2_customers
+      WHERE first_order_date IS NOT NULL
+        AND first_order_date < signup_date
+    count: 0
+    blocking: true
+
+unit_tests:
+  - name: attributes first order and lifecycle
+    inputs:
+      - asset: bruin_shop.t1_customers
+        rows:
+          - {customer_id: 10, customer_email: "buyer@example.test", customer_name: "Demo Buyer", market_id: "NY-new-york", state: "NY", city: "New York", signup_channel: "organic", signup_date: "2026-01-01"}
+      - asset: bruin_shop.t2_orders
+        rows:
+          - {order_id: 1, customer_id: 10, order_date: "2026-01-05", order_datetime: "2026-01-05 10:00:00", channel: "paid_search", is_successful_order: 1, net_revenue: 80, contribution_margin: 25}
+    expected:
+      count: 1
+      rows:
+        - {customer_id: 10, acquisition_channel: "paid_search", successful_order_count: 1, order_attempt_count: 1, lifetime_net_revenue: 80, lifetime_contribution_margin: 25, days_to_first_order: 4, lifecycle_segment: "first_time"}
+
 columns:
   - name: customer_id
-    type: integer
+    type: UInt64
     description: "Stable identifier of the customer."
     primary_key: true
     checks:
-        - name: not_null
-        - name: unique
+      - name: not_null
+      - name: unique
   - name: customer_email
-    type: varchar
-    description: "Email address associated with the customer or order."
+    type: String
+    description: "Synthetic customer email address."
+    checks:
+      - name: unique
   - name: customer_name
-    type: varchar
+    type: LowCardinality(String)
     description: "Display name of the customer."
   - name: market_id
-    type: varchar
-    description: "Identifier of the market."
+    type: String
+    description: "Stable identifier of the customer's market."
   - name: state
-    type: varchar
-    description: "State associated with the market or customer."
+    type: LowCardinality(String)
+    description: "Two-letter US state code."
   - name: city
-    type: varchar
-    description: "City associated with the market or customer."
+    type: LowCardinality(String)
+    description: "City represented by the market."
+  - name: signup_channel
+    type: LowCardinality(String)
+    description: "Channel recorded on the customer profile at signup."
   - name: acquisition_channel
-    type: varchar
-    description: "Marketing channel credited with acquiring the customer."
+    type: Nullable(String)
+    description: "Channel of the first successfully captured order, or null for prospects."
   - name: signup_date
-    type: date
+    type: Date
     description: "Date on which the customer signed up."
   - name: successful_order_count
-    type: integer
-    description: "Number of successful orders made by the customer."
+    type: UInt64
+    description: "Number of successfully captured order attempts."
     checks:
       - name: non_negative
   - name: order_attempt_count
-    type: integer
-    description: "Number of order attempts made by the customer."
+    type: UInt64
+    description: "Number of all order attempts."
     checks:
       - name: non_negative
   - name: lifetime_net_revenue
-    type: float
-    description: "Customer net revenue accumulated over successful orders."
-  - name: lifetime_contribution_profit
-    type: float
-    description: "Customer contribution profit accumulated over successful orders."
+    type: Decimal(18, 2)
+    description: "Captured order revenue net of refunds."
+    checks:
+      - name: non_negative
+  - name: lifetime_contribution_margin
+    type: Decimal(18, 2)
+    description: "Lifetime contribution margin before paid-media spend."
   - name: first_order_date
-    type: date
-    description: "Date of the customer\u2019s first successful order."
+    type: Nullable(Date)
+    description: "Date of the first successfully captured order."
   - name: latest_order_date
-    type: date
-    description: "Date of the customer\u2019s most recent successful order."
+    type: Nullable(Date)
+    description: "Date of the latest successfully captured order."
   - name: days_to_first_order
-    type: integer
-    description: "Days between customer signup and first successful order."
+    type: Nullable(Int32)
+    description: "Days from signup to the first successfully captured order."
+    checks:
+      - name: non_negative
   - name: lifecycle_segment
-    type: varchar
-    description: "Customer lifecycle segment derived from order behavior."
+    type: LowCardinality(String)
+    description: "Behavioral segment based on successfully captured orders and lifetime revenue."
+    checks:
+      - name: accepted_values
+        value: ["first_time", "loyal", "prospect", "repeat", "vip"]
 @bruin */
 
 WITH order_metrics AS (
@@ -79,10 +129,11 @@ WITH order_metrics AS (
         customer_id,
         countIf(is_successful_order = 1) AS successful_order_count,
         count() AS order_attempt_count,
-        sum(net_revenue) AS lifetime_net_revenue,
-        sum(contribution_profit) AS lifetime_contribution_profit,
-        minIf(order_date, is_successful_order = 1) AS first_order_date,
-        maxIf(order_date, is_successful_order = 1) AS latest_order_date
+        toDecimal64(sum(net_revenue), 2) AS lifetime_net_revenue,
+        toDecimal64(sum(contribution_margin), 2) AS lifetime_contribution_margin,
+        nullIf(minIf(order_date, is_successful_order = 1), toDate(0)) AS first_order_date,
+        nullIf(maxIf(order_date, is_successful_order = 1), toDate(0)) AS latest_order_date,
+        nullIf(argMinIf(channel, order_datetime, is_successful_order = 1), '') AS acquisition_channel
     FROM bruin_shop.t2_orders
     GROUP BY customer_id
 )
@@ -93,21 +144,28 @@ SELECT
     c.market_id AS market_id,
     c.state AS state,
     c.city AS city,
-    c.acquisition_channel AS acquisition_channel,
+    c.signup_channel AS signup_channel,
+    o.acquisition_channel AS acquisition_channel,
     c.signup_date AS signup_date,
-    ifNull(o.successful_order_count, 0) AS successful_order_count,
-    ifNull(o.order_attempt_count, 0) AS order_attempt_count,
-    round(ifNull(o.lifetime_net_revenue, 0.00), 2) AS lifetime_net_revenue,
-    round(ifNull(o.lifetime_contribution_profit, 0.00), 2) AS lifetime_contribution_profit,
+    ifNull(o.successful_order_count, toUInt64(0)) AS successful_order_count,
+    ifNull(o.order_attempt_count, toUInt64(0)) AS order_attempt_count,
+    ifNull(o.lifetime_net_revenue, toDecimal64(0, 2)) AS lifetime_net_revenue,
+    ifNull(o.lifetime_contribution_margin, toDecimal64(0, 2)) AS lifetime_contribution_margin,
     o.first_order_date AS first_order_date,
     o.latest_order_date AS latest_order_date,
-    if(o.first_order_date = toDate('1970-01-01'), NULL, dateDiff('day', c.signup_date, o.first_order_date)) AS days_to_first_order,
-    multiIf(
-        ifNull(o.lifetime_net_revenue, 0) >= 950, 'vip',
-        ifNull(o.successful_order_count, 0) >= 3, 'loyal',
-        ifNull(o.successful_order_count, 0) = 2, 'repeat',
-        ifNull(o.successful_order_count, 0) = 1, 'first_time',
-        'prospect'
+    if(
+        o.first_order_date IS NULL,
+        CAST(NULL, 'Nullable(Int32)'),
+        toInt32(dateDiff('day', c.signup_date, o.first_order_date))
+    ) AS days_to_first_order,
+    toLowCardinality(
+        multiIf(
+            ifNull(o.lifetime_net_revenue, toDecimal64(0, 2)) >= toDecimal64(1000, 2), 'vip',
+            ifNull(o.successful_order_count, 0) >= 5, 'loyal',
+            ifNull(o.successful_order_count, 0) >= 2, 'repeat',
+            ifNull(o.successful_order_count, 0) = 1, 'first_time',
+            'prospect'
+        )
     ) AS lifecycle_segment
 FROM bruin_shop.t1_customers AS c
 LEFT JOIN order_metrics AS o

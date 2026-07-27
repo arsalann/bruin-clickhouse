@@ -5,7 +5,7 @@ This repository contains Bruin pipelines that materialize demo data into ClickHo
 ## Pipelines
 
 - `bruin-clickhouse-101`: a small customer/order tutorial pipeline.
-- `bruin-shop-clickhouse`: a realistic ecommerce pipeline with raw, staging, and reporting layers.
+- `bruin-shop-clickhouse`: a production-style Shopify analytics showcase with synthetic source contracts (T1), conformed models (T2), and analytical marts (T3).
 
 Run from the repository root:
 

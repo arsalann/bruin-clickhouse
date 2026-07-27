@@ -1,93 +1,108 @@
 /* @bruin
 name: bruin_shop.t2_marketing_spend
 type: clickhouse.sql
-description: "T2 standardized daily marketing spend with paid-media and efficiency measures."
+description: "Conformed T2 paid-media delivery with click-through and cost-per-click measures."
 materialization:
-   type: table
-   strategy: append
+  type: table
+  strategy: time_interval
+  incremental_key: spend_date
+  time_granularity: date
 depends:
-    - bruin_shop.t1_marketing_spend
-    - bruin_shop.t2_marketing_spend_delete_interval
+  - bruin_shop.t1_marketing_spend
+
+tags:
+  - t2
+  - conformed
+domains:
+  - marketing
+meta:
+  grain: one row per date, market, and paid channel
+  source_system: conformed_ad_platforms
 
 custom_checks:
-  - name: contains rows
-    description: Ensures the materialized table is not empty.
-    query: SELECT count() > 0 FROM bruin_shop.t2_marketing_spend
+  - name: interval contains paid media
+    description: Ensures the requested interval contains standardized paid-media rows.
+    query: |
+      SELECT count() > 0
+      FROM bruin_shop.t2_marketing_spend
+      WHERE spend_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
     value: 1
     blocking: true
-  - name: marketing spend grain is unique
-    description: Ensures there is at most one standardized spend row per date, market, channel, event, and campaign.
+  - name: paid media grain is unique
+    description: Ensures one row per date, market, and paid channel.
     query: |
-      SELECT spend_date, market_id, channel, event_id, campaign_id
+      SELECT spend_date, market_id, channel
       FROM bruin_shop.t2_marketing_spend
-      GROUP BY spend_date, market_id, channel, event_id, campaign_id
+      WHERE spend_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
+      GROUP BY spend_date, market_id, channel
       HAVING count() > 1
     count: 0
     blocking: true
+
 columns:
   - name: spend_id
-    type: varchar
-    description: "Stable identifier of the marketing-spend grain."
+    type: String
+    description: "Stable identifier of the daily market-channel grain."
     primary_key: true
     checks:
-        - name: not_null
-        - name: unique
+      - name: not_null
+      - name: unique
   - name: spend_date
-    type: date
-    description: "Calendar date on which the marketing spend occurred."
+    type: Date
+    description: "Calendar date on which media delivery occurred."
   - name: market_id
-    type: varchar
-    description: "Identifier of the market."
+    type: String
+    description: "Stable identifier of the city market."
   - name: market_index
-    type: integer
-    description: "Stable numeric ordering of the market."
+    type: UInt8
+    description: "Stable numeric market ordering."
   - name: state
-    type: varchar
-    description: "State associated with the market or customer."
+    type: LowCardinality(String)
+    description: "Two-letter US state code."
   - name: city
-    type: varchar
-    description: "City associated with the market or customer."
+    type: LowCardinality(String)
+    description: "City represented by the market."
   - name: channel
-    type: varchar
-    description: "Marketing or acquisition channel associated with the record."
+    type: LowCardinality(String)
+    description: "Paid acquisition channel."
     checks:
       - name: accepted_values
-        value: ["direct", "email", "organic", "paid_search", "paid_social"]
+        value: ["paid_search", "paid_social"]
   - name: event_id
-    type: varchar
-    description: "Identifier of the associated special event."
+    type: LowCardinality(String)
+    description: "Campaign scenario active for the row, or `none`."
   - name: campaign_id
-    type: varchar
-    description: "Identifier of the marketing campaign associated with the record."
+    type: LowCardinality(String)
+    description: "Stable paid-media campaign identifier."
   - name: campaign_name
-    type: varchar
-    description: "Human-readable name of the associated marketing campaign."
+    type: LowCardinality(String)
+    description: "Human-readable campaign name."
   - name: impressions
-    type: integer
-    description: "Number of advertising or campaign impressions."
+    type: UInt64
+    description: "Number of ad impressions."
     checks:
       - name: non_negative
   - name: clicks
-    type: integer
-    description: "Number of advertising or campaign clicks."
+    type: UInt64
+    description: "Number of ad clicks."
     checks:
       - name: non_negative
   - name: spend_amount
-    type: float
-    description: "Marketing spend amount."
+    type: Decimal(18, 2)
+    description: "Paid-media spend in USD."
     checks:
       - name: non_negative
-  - name: is_paid_media
-    type: integer
-    description: "Whether the channel is paid media."
   - name: click_through_rate
-    type: float
-    description: "Clicks divided by impressions for the marketing activity."
+    type: Float64
+    description: "Clicks divided by impressions."
     checks:
-      - name: non_negative
+      - name: min
+        value: 0
+      - name: max
+        value: 1
   - name: cost_per_click
-    type: float
-    description: "Marketing spend divided by clicks."
+    type: Decimal(18, 2)
+    description: "Paid-media spend divided by clicks."
     checks:
       - name: non_negative
 @bruin */
@@ -106,9 +121,7 @@ SELECT
     impressions,
     clicks,
     spend_amount,
-    toUInt8(channel IN ('paid_search', 'paid_social')) AS is_paid_media,
-    round(if(impressions = 0, 0, clicks / impressions), 4) AS click_through_rate,
-    round(if(clicks = 0, 0, spend_amount / clicks), 4) AS cost_per_click
+    round(if(impressions = 0, 0, toFloat64(clicks) / toFloat64(impressions)), 4) AS click_through_rate,
+    toDecimal64(if(clicks = 0, 0, toFloat64(spend_amount) / toFloat64(clicks)), 2) AS cost_per_click
 FROM bruin_shop.t1_marketing_spend
 WHERE spend_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-SETTINGS insert_deduplicate = 0

@@ -1,83 +1,117 @@
 /* @bruin
 name: bruin_shop.t3_payment_reconciliation
 type: clickhouse.sql
-description: "T3 daily reconciliation mart comparing order, payment-intent, and refund outcomes."
+description: "T3 daily reconciliation of order attempts, payment intents, captured amounts, and refunds."
 materialization:
-   type: table
-   strategy: append
+  type: table
+  strategy: time_interval
+  incremental_key: reconciliation_date
+  time_granularity: date
 depends:
-    - bruin_shop.t2_orders
-    - bruin_shop.t1_orders
-    - bruin_shop.t1_payment_intents
-    - bruin_shop.t1_refunds
-    - bruin_shop.t3_payment_reconciliation_delete_interval
+  - bruin_shop.t2_orders
+  - bruin_shop.t1_payment_intents
+  - bruin_shop.t1_refunds
+
+tags:
+  - t3
+  - mart
+domains:
+  - finance
+meta:
+  grain: one row per calendar date
 
 custom_checks:
-  - name: contains rows
-    description: Ensures the materialized table is not empty.
-    query: SELECT count() > 0 FROM bruin_shop.t3_payment_reconciliation
+  - name: interval contains reconciliation rows
+    description: Ensures the requested interval contains daily reconciliation rows.
+    query: |
+      SELECT count() > 0
+      FROM bruin_shop.t3_payment_reconciliation
+      WHERE reconciliation_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
     value: 1
     blocking: true
+  - name: daily payments and refunds reconcile
+    description: Ensures order counts, captured amounts, and refunds agree with provider-style records.
+    query: |
+      SELECT reconciliation_date
+      FROM bruin_shop.t3_payment_reconciliation
+      WHERE reconciliation_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
+        AND (
+          payment_intent_count_gap != 0
+          OR succeeded_payment_count_gap != 0
+          OR succeeded_payment_amount_gap != 0
+          OR refund_record_count_gap != 0
+          OR refund_amount_gap != 0
+        )
+    count: 0
+    blocking: true
+
 columns:
   - name: reconciliation_date
-    type: date
+    type: Date
     description: "Calendar date represented by the reconciliation row."
     primary_key: true
     checks:
-        - name: not_null
-        - name: unique
+      - name: not_null
+      - name: unique
   - name: order_attempts
-    type: integer
-    description: "Number of order attempts in the period."
-    checks:
-      - name: non_negative
+    type: UInt64
+    description: "Number of all order attempts."
   - name: cancelled_orders
-    type: integer
+    type: UInt64
     description: "Number of cancelled order attempts."
   - name: successful_orders
-    type: integer
-    description: "Number of successfully paid orders."
-    checks:
-      - name: non_negative
+    type: UInt64
+    description: "Number of successfully captured orders."
   - name: payment_intents
-    type: integer
-    description: "Number of payment intents created in the period."
-    checks:
-      - name: non_negative
+    type: UInt64
+    description: "Number of payment intents."
   - name: succeeded_payment_intents
-    type: integer
-    description: "Number of payment intents with a succeeded status."
-    checks:
-      - name: non_negative
+    type: UInt64
+    description: "Number of succeeded payment intents."
   - name: canceled_payment_intents
-    type: integer
-    description: "Number of payment intents with a canceled status."
-  - name: successful_order_gap
-    type: integer
-    description: "Difference between successful orders and succeeded payment intents."
-  - name: successful_amount_gap
-    type: float
-    description: "Difference between successful order and successful payment-intent amounts."
+    type: UInt64
+    description: "Number of canceled payment intents."
+  - name: payment_intent_count_gap
+    type: Int64
+    description: "Order attempts minus payment intents."
+  - name: succeeded_payment_count_gap
+    type: Int64
+    description: "Successfully captured orders minus succeeded payment intents."
+  - name: successful_order_amount
+    type: Decimal(18, 2)
+    description: "Payment amount on successfully captured orders."
+    checks:
+      - name: non_negative
+  - name: succeeded_payment_amount
+    type: Decimal(18, 2)
+    description: "Amount on succeeded payment intents."
+    checks:
+      - name: non_negative
+  - name: succeeded_payment_amount_gap
+    type: Decimal(18, 2)
+    description: "Successful-order payment amount minus succeeded-intent amount."
   - name: refunded_orders
-    type: integer
-    description: "Number of refunded order attempts."
-    checks:
-      - name: non_negative
+    type: UInt64
+    description: "Number of orders with refund records."
+  - name: provider_refund_records
+    type: UInt64
+    description: "Number of provider-style refund records."
+  - name: refund_record_count_gap
+    type: Int64
+    description: "Refunded orders minus provider-style refund records."
   - name: order_refund_amount
-    type: float
-    description: "Refund value calculated from order records."
+    type: Decimal(18, 2)
+    description: "Refund amount carried on conformed orders."
     checks:
       - name: non_negative
-  - name: stripe_refund_records
-    type: integer
-    description: "Number of refund records reported by the payment provider."
+  - name: provider_refund_amount
+    type: Decimal(18, 2)
+    description: "Refund amount from provider-style records."
     checks:
       - name: non_negative
-  - name: stripe_refund_amount
-    type: float
-    description: "Refund value calculated from payment-provider records."
-    checks:
-      - name: non_negative
+  - name: refund_amount_gap
+    type: Decimal(18, 2)
+    description: "Conformed-order refunds minus provider-style refunds."
 @bruin */
 
 WITH
@@ -85,54 +119,73 @@ WITH
         SELECT
             order_date AS reconciliation_date,
             count() AS order_attempts,
-            countIf(order_status = 'cancelled') AS cancelled_orders,
-            countIf(order_status != 'cancelled') AS successful_orders,
-            round(sumIf(total_amount, order_status != 'cancelled'), 2) AS successful_order_amount,
+            countIf(is_cancelled_order = 1) AS cancelled_orders,
+            countIf(is_successful_order = 1) AS successful_orders,
+            toDecimal64(sumIf(payment_amount, is_successful_order = 1), 2) AS successful_order_amount,
             countIf(has_refund = 1) AS refunded_orders,
-            round(sum(refund_amount), 2) AS order_refund_amount
+            toDecimal64(sum(refund_amount), 2) AS order_refund_amount
         FROM bruin_shop.t2_orders
         WHERE order_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
         GROUP BY order_date
     ),
     payments AS (
         SELECT
-            toDate(created_at) AS reconciliation_date,
+            payment_date AS reconciliation_date,
             count() AS payment_intents,
             countIf(status = 'succeeded') AS succeeded_payment_intents,
             countIf(status = 'canceled') AS canceled_payment_intents,
-            round(sumIf(amount, status = 'succeeded'), 2) AS succeeded_payment_amount
+            toDecimal64(sumIf(amount, status = 'succeeded'), 2) AS succeeded_payment_amount
         FROM bruin_shop.t1_payment_intents
-        WHERE toDate(created_at) BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-        GROUP BY toDate(created_at)
+        WHERE payment_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
+        GROUP BY payment_date
     ),
     refunds AS (
         SELECT
-            o.order_date AS reconciliation_date,
-            count() AS refund_records,
-            round(sum(r.refund_amount), 2) AS stripe_refund_amount
-        FROM bruin_shop.t1_refunds AS r
-        INNER JOIN bruin_shop.t1_orders AS o
-            ON r.order_id = o.order_id
-        WHERE o.order_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-        GROUP BY o.order_date
+            order_date AS reconciliation_date,
+            count() AS provider_refund_records,
+            toDecimal64(sum(refund_amount), 2) AS provider_refund_amount
+        FROM bruin_shop.t1_refunds
+        WHERE order_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
+        GROUP BY order_date
+    ),
+    joined AS (
+        SELECT
+            o.reconciliation_date AS reconciliation_date,
+            o.order_attempts AS order_attempts,
+            o.cancelled_orders AS cancelled_orders,
+            o.successful_orders AS successful_orders,
+            o.successful_order_amount AS successful_order_amount,
+            o.refunded_orders AS refunded_orders,
+            o.order_refund_amount AS order_refund_amount,
+            ifNull(p.payment_intents, toUInt64(0)) AS payment_intents,
+            ifNull(p.succeeded_payment_intents, toUInt64(0)) AS succeeded_payment_intents,
+            ifNull(p.canceled_payment_intents, toUInt64(0)) AS canceled_payment_intents,
+            ifNull(p.succeeded_payment_amount, toDecimal64(0, 2)) AS succeeded_payment_amount,
+            ifNull(r.provider_refund_records, toUInt64(0)) AS provider_refund_records,
+            ifNull(r.provider_refund_amount, toDecimal64(0, 2)) AS provider_refund_amount
+        FROM orders AS o
+        LEFT JOIN payments AS p
+            ON o.reconciliation_date = p.reconciliation_date
+        LEFT JOIN refunds AS r
+            ON o.reconciliation_date = r.reconciliation_date
     )
 SELECT
-    o.reconciliation_date AS reconciliation_date,
-    o.order_attempts AS order_attempts,
-    o.cancelled_orders AS cancelled_orders,
-    o.successful_orders AS successful_orders,
-    ifNull(p.payment_intents, 0) AS payment_intents,
-    ifNull(p.succeeded_payment_intents, 0) AS succeeded_payment_intents,
-    ifNull(p.canceled_payment_intents, 0) AS canceled_payment_intents,
-    o.successful_orders - ifNull(p.succeeded_payment_intents, 0) AS successful_order_gap,
-    round(o.successful_order_amount - ifNull(p.succeeded_payment_amount, 0.00), 2) AS successful_amount_gap,
-    o.refunded_orders AS refunded_orders,
-    o.order_refund_amount AS order_refund_amount,
-    ifNull(r.refund_records, 0) AS stripe_refund_records,
-    ifNull(r.stripe_refund_amount, 0.00) AS stripe_refund_amount
-FROM orders AS o
-LEFT JOIN payments AS p
-    ON o.reconciliation_date = p.reconciliation_date
-LEFT JOIN refunds AS r
-    ON o.reconciliation_date = r.reconciliation_date
-SETTINGS insert_deduplicate = 0
+    reconciliation_date,
+    order_attempts,
+    cancelled_orders,
+    successful_orders,
+    payment_intents,
+    succeeded_payment_intents,
+    canceled_payment_intents,
+    toInt64(order_attempts) - toInt64(payment_intents) AS payment_intent_count_gap,
+    toInt64(successful_orders) - toInt64(succeeded_payment_intents) AS succeeded_payment_count_gap,
+    successful_order_amount,
+    succeeded_payment_amount,
+    toDecimal64(successful_order_amount - succeeded_payment_amount, 2) AS succeeded_payment_amount_gap,
+    refunded_orders,
+    provider_refund_records,
+    toInt64(refunded_orders) - toInt64(provider_refund_records) AS refund_record_count_gap,
+    order_refund_amount,
+    provider_refund_amount,
+    toDecimal64(order_refund_amount - provider_refund_amount, 2) AS refund_amount_gap
+FROM joined

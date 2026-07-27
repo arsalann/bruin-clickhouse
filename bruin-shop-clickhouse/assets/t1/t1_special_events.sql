@@ -1,15 +1,27 @@
 /* @bruin
 name: bruin_shop.t1_special_events
 type: clickhouse.sql
-description: "T1 catalog of planned campaigns and operational events that affect ecommerce performance."
+description: "Synthetic T1 event catalog at one row per campaign or operational scenario."
 materialization:
-   type: table
+  type: table
+  strategy: create+replace
+
+tags:
+  - t1
+  - source
+  - synthetic
+domains:
+  - commerce
+  - marketing
+meta:
+  grain: one row per event
+  source_system: synthetic_reference
 
 custom_checks:
-  - name: contains rows
-    description: Ensures the materialized table is not empty.
-    query: SELECT count() > 0 FROM bruin_shop.t1_special_events
-    value: 1
+  - name: contains eight scenarios
+    description: Ensures the fixed event catalog remains complete.
+    query: SELECT count() FROM bruin_shop.t1_special_events
+    value: 8
     blocking: true
   - name: event dates are ordered
     description: Ensures every special event ends on or after its start date.
@@ -21,45 +33,45 @@ custom_checks:
     blocking: true
 columns:
   - name: event_id
-    type: varchar
+    type: String
     description: "Identifier of the associated special event."
     primary_key: true
     checks:
-        - name: not_null
-        - name: unique
+      - name: not_null
+      - name: unique
   - name: event_name
-    type: varchar
+    type: LowCardinality(String)
     description: "Human-readable name of the special event."
   - name: event_type
-    type: varchar
+    type: LowCardinality(String)
     description: "Classification of the special event scenario."
     checks:
       - name: accepted_values
         value: ["campaign_failure", "campaign_win", "outage", "product_defect", "stockout"]
   - name: start_date
-    type: date
+    type: Date
     description: "Date on which the event starts."
   - name: end_date
-    type: date
+    type: Date
     description: "Date on which the event ends."
   - name: channel
-    type: varchar
+    type: LowCardinality(String)
     description: "Marketing or acquisition channel associated with the record."
   - name: product_id
-    type: varchar
+    type: String
     description: "Stable identifier of the product."
   - name: spend_multiplier
-    type: float
+    type: Float64
     description: "Event-specific multiplier applied to marketing spend."
     checks:
       - name: non_negative
   - name: session_multiplier
-    type: float
+    type: Float64
     description: "Event-specific multiplier applied to session volume."
     checks:
       - name: non_negative
   - name: conversion_multiplier
-    type: float
+    type: Float64
     description: "Event-specific multiplier applied to conversion behavior."
     checks:
       - name: non_negative
@@ -77,11 +89,11 @@ WITH arrayJoin([
 ]) AS event
 SELECT
     tupleElement(event, 1) AS event_id,
-    tupleElement(event, 2) AS event_name,
-    tupleElement(event, 3) AS event_type,
+    toLowCardinality(tupleElement(event, 2)) AS event_name,
+    toLowCardinality(tupleElement(event, 3)) AS event_type,
     tupleElement(event, 4) AS start_date,
     tupleElement(event, 5) AS end_date,
-    tupleElement(event, 6) AS channel,
+    toLowCardinality(tupleElement(event, 6)) AS channel,
     tupleElement(event, 7) AS product_id,
     toFloat64(tupleElement(event, 8)) AS spend_multiplier,
     toFloat64(tupleElement(event, 9)) AS session_multiplier,

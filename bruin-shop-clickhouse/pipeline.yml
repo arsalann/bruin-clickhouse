@@ -1,7 +1,23 @@
 name: bruin-shop-clickhouse
-schedule: daily
-start_date: "2026-01-01"
+schedule: "@daily"
+start_date: "2025-01-01"
 catchup: false
 
 default_connections:
     clickhouse: "clickhouse-default"
+
+tags:
+    - clickhouse
+    - ecommerce
+    - showcase
+    - synthetic
+
+domains:
+    - commerce
+    - finance
+    - marketing
+
+meta:
+    description: "Self-contained Shopify analytics warehouse showcase for Bruin and ClickHouse."
+    data_classification: synthetic
+    source_mode: self-contained-demo

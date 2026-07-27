@@ -1,53 +1,80 @@
 /* @bruin
 name: bruin_shop.t1_products
 type: clickhouse.sql
-description: "T1 product catalog with pricing, cost, inventory, and lifecycle attributes."
+description: "Synthetic Shopify-style T1 product catalog at one row per product."
 materialization:
-   type: table
+  type: table
+  strategy: create+replace
+
+tags:
+  - t1
+  - source
+  - synthetic
+domains:
+  - commerce
+meta:
+  grain: one row per product
+  source_system: synthetic_shopify
 
 custom_checks:
-  - name: contains rows
-    description: Ensures the materialized table is not empty.
-    query: SELECT count() > 0 FROM bruin_shop.t1_products
-    value: 1
+  - name: contains twenty demo products
+    description: Ensures the fixed product catalog remains complete.
+    query: SELECT count() FROM bruin_shop.t1_products
+    value: 20
+    blocking: true
+  - name: unit cost does not exceed price
+    description: Ensures every product has a non-negative catalog margin.
+    query: |
+      SELECT product_id
+      FROM bruin_shop.t1_products
+      WHERE unit_cogs > list_price
+    count: 0
     blocking: true
 columns:
   - name: product_id
-    type: varchar
+    type: String
     description: "Stable identifier of the product."
     primary_key: true
     checks:
-        - name: not_null
-        - name: unique
+      - name: not_null
+      - name: unique
   - name: product_name
-    type: varchar
+    type: String
     description: "Display name of the product."
   - name: category
-    type: varchar
+    type: LowCardinality(String)
     description: "Merchandise category assigned to the product."
+    checks:
+      - name: accepted_values
+        value: ["accessories", "pants", "shoes", "tshirts"]
   - name: sku
-    type: varchar
+    type: String
     description: "Stock-keeping unit assigned to the product."
+    checks:
+      - name: unique
   - name: list_price
-    type: float
-    description: "Catalog list price per product unit."
+    type: Decimal(18, 2)
+    description: "Catalog unit price in USD."
     checks:
       - name: positive
   - name: unit_cogs
-    type: float
-    description: "Cost of goods sold per product unit."
+    type: Decimal(18, 2)
+    description: "Standard unit cost in USD."
     checks:
       - name: non_negative
   - name: inventory_on_hand
-    type: integer
-    description: "Current sellable units available in inventory."
+    type: UInt32
+    description: "Current synthetic sellable inventory units."
     checks:
       - name: non_negative
   - name: is_active
-    type: integer
+    type: UInt8
     description: "Whether the product is active in the catalog."
+    checks:
+      - name: accepted_values
+        value: [0, 1]
   - name: launch_date
-    type: date
+    type: Date
     description: "Date on which the product was launched."
 @bruin */
 
@@ -76,10 +103,16 @@ WITH arrayJoin([
 SELECT
     tupleElement(product, 1) AS product_id,
     tupleElement(product, 2) AS product_name,
-    tupleElement(product, 3) AS category,
+    toLowCardinality(tupleElement(product, 3)) AS category,
     tupleElement(product, 4) AS sku,
-    toFloat64(tupleElement(product, 5)) AS list_price,
-    toFloat64(tupleElement(product, 6)) AS unit_cogs,
+    toDecimal64(tupleElement(product, 5), 2) AS list_price,
+    toDecimal64(tupleElement(product, 6), 2) AS unit_cogs,
     toUInt32(tupleElement(product, 7)) AS inventory_on_hand,
-    1 AS is_active,
-    multiIf(tupleElement(product, 3) = 'shoes', toDate('2025-11-01'), tupleElement(product, 3) = 'accessories', toDate('2025-09-15'), toDate('2025-08-01')) AS launch_date
+    toUInt8(1) AS is_active,
+    multiIf(
+        tupleElement(product, 1) = 'prod_shoes_04', toDate('2026-03-10'),
+        tupleElement(product, 3) = 'shoes', toDate('2024-03-01'),
+        tupleElement(product, 3) = 'accessories', toDate('2024-05-15'),
+        tupleElement(product, 3) = 'pants', toDate('2023-09-01'),
+        toDate('2023-06-01')
+    ) AS launch_date

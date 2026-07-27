@@ -1,48 +1,63 @@
 /* @bruin
 name: bruin_shop.t1_markets
 type: clickhouse.sql
-description: "T1 market dimension with geography, demand weighting, and tax assumptions."
+description: "Synthetic T1 market dimension at one row per US city market."
 materialization:
-   type: table
+  type: table
+  strategy: create+replace
+
+tags:
+  - t1
+  - source
+  - synthetic
+domains:
+  - commerce
+  - marketing
+meta:
+  grain: one row per market
+  source_system: synthetic_reference
 
 custom_checks:
-  - name: contains rows
-    description: Ensures the materialized table is not empty.
-    query: SELECT count() > 0 FROM bruin_shop.t1_markets
-    value: 1
+  - name: contains twelve demo markets
+    description: Ensures the fixed market catalog remains complete.
+    query: SELECT count() FROM bruin_shop.t1_markets
+    value: 12
     blocking: true
 columns:
   - name: market_id
-    type: varchar
-    description: "Identifier of the market."
+    type: String
+    description: "Stable identifier of the city market."
     primary_key: true
     checks:
-        - name: not_null
-        - name: unique
+      - name: not_null
+      - name: unique
   - name: market_index
-    type: integer
-    description: "Stable numeric ordering of the market."
+    type: UInt8
+    description: "Stable numeric market ordering used by synthetic keys."
     checks:
       - name: positive
+      - name: unique
   - name: state
-    type: varchar
-    description: "State associated with the market or customer."
+    type: LowCardinality(String)
+    description: "Two-letter US state code."
   - name: city
-    type: varchar
-    description: "City associated with the market or customer."
+    type: LowCardinality(String)
+    description: "City represented by the market."
   - name: region
-    type: varchar
-    description: "Geographic region containing the market."
+    type: LowCardinality(String)
+    description: "US census-style region containing the market."
   - name: demand_weight
-    type: float
-    description: "Relative market demand factor used by the synthetic source model."
+    type: Float64
+    description: "Relative demand multiplier used by the synthetic source model."
     checks:
       - name: positive
   - name: tax_rate
-    type: float
-    description: "Tax rate applied in the market."
+    type: Decimal(18, 4)
+    description: "Simplified sales-tax rate applied to generated orders."
     checks:
       - name: non_negative
+      - name: max
+        value: 0.2
 @bruin */
 
 WITH arrayJoin([
@@ -62,8 +77,8 @@ WITH arrayJoin([
 SELECT
     concat(tupleElement(market, 2), '-', replaceAll(lower(tupleElement(market, 3)), ' ', '-')) AS market_id,
     toUInt8(tupleElement(market, 1)) AS market_index,
-    tupleElement(market, 2) AS state,
-    tupleElement(market, 3) AS city,
-    tupleElement(market, 4) AS region,
+    toLowCardinality(tupleElement(market, 2)) AS state,
+    toLowCardinality(tupleElement(market, 3)) AS city,
+    toLowCardinality(tupleElement(market, 4)) AS region,
     toFloat64(tupleElement(market, 5)) AS demand_weight,
-    toFloat64(tupleElement(market, 6)) AS tax_rate
+    toDecimal64(tupleElement(market, 6), 4) AS tax_rate

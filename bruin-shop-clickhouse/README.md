@@ -1,66 +1,127 @@
 # Bruin Shop ClickHouse
 
-This pipeline is a native ClickHouse replication of the ecommerce modeling shape from `/Users/bear/Github/data_playground/bruin-shop`. It is organized into T1 deterministic ecommerce source data, T2 standardized operational facts, and T3 analytical marts for revenue, marketing, cohorts, products, payments, and injected special events.
+A self-contained Shopify analytics warehouse showcase built with Bruin and ClickHouse. It models the data contracts and operating patterns of a small direct-to-consumer shop without requiring external credentials.
 
-## Pipeline Graph
+The source layer is deliberately synthetic. It generates deterministic, non-personal data shaped like Shopify, Stripe, GA4, Google Ads, and Meta Ads records. The downstream layers are production-style SQL models and can be retained when the synthetic assets are replaced with real Bruin `ingestr` assets.
 
-### T1
+## What the pipeline covers
 
-- `t1_markets`: US market dimension used for demand and geography.
-- `t1_special_events`: campaign, outage, stockout, and defect scenarios.
-- `t1_products`: apparel product catalog with price, COGS, and inventory.
-- `t1_customers`: deterministic customer profiles by market.
-- `t1_marketing_spend`: daily channel spend, impressions, and clicks.
-- `t1_web_sessions`: web funnel activity derived from spend and market demand.
-- `t1_orders`: Shopify-style order attempts generated from sessions.
-- `t1_payment_intents`: Stripe-style payment records, one per order attempt.
-- `t1_refunds`: Stripe-style refund records for refunded orders.
+- Shopify-style customers, products, order headers, and normalized order lines.
+- Stripe-style payment intents and full or partial refunds.
+- GA4-style daily web funnels across five acquisition channels.
+- Google Ads and Meta Ads-style paid-media delivery and spend.
+- Geography, inventory, lifecycle, cohort, product, reconciliation, and event-impact analysis.
+- Eight deterministic scenarios: campaign wins and failures, an outage, a product defect, a launch, and a stockout.
 
-### T2
+All generated email addresses use the reserved `demo-shop.example` domain. No source row contains real customer or credential data.
 
-- `t2_orders`: standardized order fact with payment and refund reconciliation.
-- `t2_customers`: customer lifetime metrics and lifecycle segments.
-- `t2_products`: active product catalog with gross-margin context.
-- `t2_marketing_spend`: normalized marketing spend by channel and market.
-- `t2_web_sessions`: web sessions with attributed order and revenue metrics.
+## Architecture
 
-### T3
+```text
+T1 source contracts
+markets ─┬─> customers ───────────────────────────────┐
+         ├─> paid media ─> web sessions ─> order lines ─> orders
+events ──┘                         products ───────────┘      │
+                                                             ├─> payment intents
+                                                             └─> refunds
 
-- `t3_daily_revenue`: daily revenue, orders, refunds, COGS, and profit.
-- `t3_daily_kpis`: executive daily KPIs across revenue, web, and spend.
-- `t3_marketing_roi`: daily channel and market ROI.
-- `t3_customer_cohorts`: monthly cohort retention and revenue.
-- `t3_product_performance`: catalog sales, refund rate, and inventory value.
-- `t3_payment_reconciliation`: Shopify-vs-Stripe reconciliation checks.
-- `t3_special_event_impact`: event-window impact against a 14-day baseline.
+T2 conformed models
+orders + payments + refunds ─> conformed orders ─┬─> customers
+order lines + conformed orders ─> conformed lines ├─> web attribution
+products ─> conformed products                    └─> downstream marts
+paid media ─> conformed paid media
 
-## Injected Scenarios
+T3 analytical marts
+daily revenue ─> daily KPIs
+marketing ROI | customer cohorts | product performance
+payment reconciliation | special-event impact
+```
 
-The synthetic data includes realistic ecommerce incidents and campaigns:
+### T1: source contracts
 
-- Paid search broad-match failure from 2026-01-12 through 2026-01-18.
-- Checkout outage on 2026-02-04.
-- Black Tote Bag defect refund incident from 2026-02-20 through 2026-02-24.
-- Instagram trail shoe launch from 2026-03-10 through 2026-03-17.
-- Instagram trail shoe stockout from 2026-03-18 through 2026-03-21.
-- Instagram spring outfit campaign from 2026-04-08 through 2026-04-14.
-- Google Memorial Day search campaign from 2026-05-11 through 2026-05-17.
-- Google summer sale from 2026-06-07 through 2026-06-08.
+T1 represents what would normally land from operational systems. Dimensions are reproducible snapshots; dated facts are regenerated only for the requested run interval.
 
-## Commands
+- `t1_markets`, `t1_products`, and `t1_special_events` provide reference data.
+- `t1_customers` supplies 120,000 deterministic customer profiles with valid signup timing.
+- `t1_marketing_spend` contains only paid search and paid social delivery.
+- `t1_web_sessions` contains paid and non-paid funnel activity.
+- `t1_order_line_items` is the normalized basket grain; orders can contain one to three product lines.
+- `t1_orders` aggregates line items into unique Shopify-style order headers.
+- `t1_payment_intents` and `t1_refunds` provide payment-provider-style financial records.
 
-These commands use the real repository Bruin config at `.bruin.yml`. The ClickHouse connection has no default database; every asset and table reference is explicitly scoped to the `bruin_shop` database in the `default` environment.
+### T2: conformed models
 
-Validate:
+T2 standardizes source records and applies shared business rules.
+
+- A successful order means payment was captured and the order was not cancelled. A later full refund does not erase the original conversion.
+- Refunds are allocated proportionally to order lines, with the final line absorbing any rounding residual.
+- Net revenue is captured order value less refunds.
+- Gross profit is net revenue less recognized product cost.
+- Contribution margin is gross profit less fulfillment and payment-processing costs. It is intentionally before paid-media spend.
+- Customer acquisition channel is the first successfully captured order channel; profile signup channel remains a separate field.
+
+### T3: analytical marts
+
+T3 exposes stable reporting grains for dashboards and analysis.
+
+- Daily commerce and executive KPIs.
+- Paid-media ROI and customer-acquisition cost by date, market, and paid channel.
+- Monthly first-order cohorts and retention.
+- Product sales, allocated refunds, realized margin, and inventory context.
+- Daily order/payment/refund reconciliation.
+- Event-period results against the preceding 14-day baseline. Product-specific events scope orders to baskets containing that product.
+
+## Materialization and physical design
+
+Bruin manages all refresh behavior; there are no hand-written delete helpers.
+
+| Assets | Materialization | Refresh behavior |
+|---|---|---|
+| T1 reference/customer snapshots | `table / create+replace` | Rebuild complete deterministic snapshot |
+| T1 dated source facts | `table / time_interval` | Replace only requested source dates |
+| T2 customer/product snapshots | `table / create+replace` | Recompute complete conformed dimension |
+| T2 dated facts | `table / time_interval` | Replace only requested business dates |
+| T3 cohort/product/event marts | `table / create+replace` | Recompute small all-history summary |
+| T3 daily/marketing/reconciliation marts | `table / time_interval` | Replace only requested reporting dates |
+
+The demo tables are intentionally unpartitioned: the complete warehouse is only tens of megabytes, and ClickHouse partitions are primarily a data-lifecycle feature rather than a substitute for the sparse primary-key index. Dated-fact identifiers begin with or derive from time, so their sorting keys still follow the dominant date access pattern. Add monthly partitions only when retention operations or materially larger volumes justify them, and verify that the installed Bruin version renders the desired ClickHouse DDL. Monetary values use `Decimal`; bounded categorical columns use `LowCardinality(String)`. The target database is explicitly qualified as `bruin_shop`.
+
+On a normal `time_interval` run, Bruin deletes and reinserts the inclusive date window and adds ClickHouse's rerun-safe insert setting. On `--full-refresh`, Bruin creates or replaces the table from the asset query. See the [Bruin ClickHouse platform guide](https://getbruin.com/docs/bruin/platforms/clickhouse) and [materialization reference](https://getbruin.com/docs/bruin/assets/materialization.html).
+
+## Quality and unit tests
+
+The assets declare their columns, data types, descriptions, primary keys, domains, tags, and grains. Checks cover:
+
+- Not-null, uniqueness, positivity, ranges, and accepted categorical values.
+- Funnel ordering, customer signup timing, and product launch timing.
+- Order-total, payment-intent, refund, line-allocation, and contribution arithmetic.
+- Snapshot population preservation and interval coverage.
+- Cohort bounds, reporting grain uniqueness, and event catalog coverage.
+
+Six read-only Bruin unit tests pin the highest-risk transformation logic: partial-refund order economics, line-level refund allocation, first-order attribution, product margin, cohort retention, and daily revenue aggregation.
+
+## Running locally
+
+Commands below assume the repository root, the `default` environment, and a configured `clickhouse-default` connection in the gitignored `.bruin.yml`. Never commit real credentials.
+
+Validate the full DAG:
 
 ```bash
 bruin validate bruin-shop-clickhouse/pipeline.yml \
   --config-file .bruin.yml \
-  --environment default \
-  --exclude-warnings
+  --environment default
 ```
 
-Render the final KPI mart:
+Run read-only unit tests:
+
+```bash
+bruin unit-test bruin-shop-clickhouse/pipeline.yml \
+  --environment default \
+  --start-date 2026-01-01 \
+  --end-date 2026-02-28
+```
+
+Render one asset:
 
 ```bash
 bruin render bruin-shop-clickhouse/assets/t3/t3_daily_kpis.sql \
@@ -69,63 +130,96 @@ bruin render bruin-shop-clickhouse/assets/t3/t3_daily_kpis.sql \
   --end-date 2026-06-01
 ```
 
-Bootstrap or restore the historical window:
+Bootstrap or rebuild history from the pipeline start through yesterday:
 
 ```bash
 bruin run bruin-shop-clickhouse/pipeline.yml \
   --config-file .bruin.yml \
   --environment default \
   --only main \
-  --workers 1 \
+  --workers 4 \
   --start-date 2025-01-01 \
-  --end-date 2026-07-24 \
   --full-refresh
 ```
 
-Run a normal daily interval:
-
-```bash
-bruin run bruin-shop-clickhouse/pipeline.yml \
-  --config-file .bruin.yml \
-  --environment default \
-  --only main \
-  --workers 1 \
-  --start-date 2026-06-01 \
-  --end-date 2026-06-01
-```
-
-Run quality checks:
+Run checks over the same history after a rebuild:
 
 ```bash
 bruin run bruin-shop-clickhouse/pipeline.yml \
   --config-file .bruin.yml \
   --environment default \
   --only checks \
-  --workers 1 \
-  --start-date 2026-01-01 \
-  --end-date 2026-06-30
+  --workers 4 \
+  --start-date 2025-01-01
 ```
 
-Query the final marts:
+Run the normal daily pipeline for yesterday, including checks:
+
+```bash
+bruin run bruin-shop-clickhouse/pipeline.yml \
+  --config-file .bruin.yml \
+  --environment default \
+  --workers 4
+```
+
+Rerun a specific interval safely:
+
+```bash
+bruin run bruin-shop-clickhouse/pipeline.yml \
+  --config-file .bruin.yml \
+  --environment default \
+  --workers 4 \
+  --start-date 2026-06-01 \
+  --end-date 2026-06-07
+```
+
+Query a reporting mart:
 
 ```bash
 bruin query \
   --config-file .bruin.yml \
-  --environment default \
   --connection clickhouse-default \
-  --query "select * from bruin_shop.t3_daily_kpis order by metric_date desc limit 10"
+  --query "SELECT * FROM bruin_shop.t3_daily_kpis ORDER BY metric_date DESC LIMIT 10" \
+  --description "Review recent shop KPIs"
 ```
 
-## Incremental Behavior
+## Replacing synthetic sources with live data
 
-The daily date-grained assets use Bruin's `{{ start_date }}` and `{{ end_date }}` variables directly. Normal runs replace only the requested interval instead of recreating the full history:
+Keep the T2 and T3 contracts, then replace the T1 generators with Bruin `ingestr` landing assets and thin normalization models:
 
-- Date-grained T1, T2, and T3 tables use `append`.
-- Each append asset depends on a matching `*_delete_interval` helper.
-- Each helper runs `ALTER TABLE ... DELETE WHERE <date column> BETWEEN {{ start_date }} AND {{ end_date }} SETTINGS mutations_sync = 2`.
-- Append queries end with `SETTINGS insert_deduplicate = 0` so rerunning the same deterministic interval inserts the replacement rows after the delete.
-- Small full-table summary and dimension-like assets use `truncate+insert`.
+| T1 contract | Typical live source |
+|---|---|
+| Customers | Shopify `customers` |
+| Products and inventory | Shopify `products`, `inventory_items` |
+| Order headers and lines | Shopify `orders` and nested line items |
+| Payment intents and refunds | Stripe `payment_intent`, `refund`, or Shopify `transactions` |
+| Web funnel | GA4 `custom` report |
+| Paid-media spend | Google Ads daily reports and Meta `facebook_insights` |
+| Markets | Shop configuration or maintained seed |
+| Special events | Incident and campaign calendar maintained by the business |
 
-The bootstrap command should be a `--full-refresh` run so Bruin creates the target tables before interval helpers are needed. After bootstrap, daily runs can be rerun safely for the same date or a wider date window.
+Shopify's supported Bruin source tables use primary-key merges, usually on `updated_at`; Shopify `transactions` merges by `id`. Stripe payment and refund tables merge by `id` and `created`. See the [Shopify source reference](https://getbruin.com/docs/ingestr/supported-sources/shopify.html) and [Bruin ingestr asset guide](https://getbruin.com/docs/bruin/assets/ingestr.html).
 
-Refund records are generated from orders and are incrementally keyed by the originating `order_date`; `refund_created_at` can fall 1-10 days later. This keeps revenue and payment reconciliation reports aligned to Shopify order dates.
+For live data, also decide explicitly how to handle:
+
+- Store and reporting time zones.
+- Presentment versus shop currency and foreign-exchange conversion.
+- Taxes, duties, gift cards, shipping refunds, exchanges, and chargebacks.
+- Late-arriving order updates and refund lookback windows.
+- Customer deletion and privacy requests.
+- Attribution identity, window, and model. The showcase uses deterministic same-day last-channel attribution, not causal incrementality.
+
+## Scenario catalog
+
+The fixed 2026 scenarios make the marts useful for demos and regression testing:
+
+| Scenario | Dates | Intended signal |
+|---|---|---|
+| Paid-search broad-match failure | Jan 12–18 | Spend with weak conversion |
+| Checkout outage | Feb 4 | Sessions and conversion collapse |
+| Black Tote Bag defect | Feb 20–24 | Elevated partial refunds |
+| Trail shoe launch | Mar 10–17 | Paid-social product lift |
+| Trail shoe stockout | Mar 18–21 | Product availability collapse |
+| Spring outfit campaign | Apr 8–14 | Paid-social lift |
+| Memorial Day search | May 11–17 | Paid-search lift |
+| Google summer sale | Jun 7–8 | Short paid-search lift |

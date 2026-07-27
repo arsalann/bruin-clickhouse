@@ -1,78 +1,119 @@
 /* @bruin
 name: bruin_shop.t1_payment_intents
 type: clickhouse.sql
-description: "T1 payment-intent records associated with ecommerce order attempts."
+description: "Synthetic Stripe-style T1 payment intents at one row per order attempt."
 materialization:
-   type: table
-   strategy: append
+  type: table
+  strategy: time_interval
+  incremental_key: payment_date
+  time_granularity: date
 depends:
-    - bruin_shop.t1_orders
-    - bruin_shop.t1_payment_intents_delete_interval
+  - bruin_shop.t1_orders
+
+tags:
+  - t1
+  - source
+  - synthetic
+domains:
+  - finance
+meta:
+  grain: one row per order attempt
+  source_system: synthetic_stripe
 
 custom_checks:
-  - name: contains rows
-    description: Ensures the materialized table is not empty.
-    query: SELECT count() > 0 FROM bruin_shop.t1_payment_intents
-    value: 1
+  - name: every interval order has one payment intent
+    description: Ensures one-to-one order and payment-intent coverage for the requested interval.
+    query: |
+      SELECT o.order_id
+      FROM bruin_shop.t1_orders AS o
+      LEFT JOIN bruin_shop.t1_payment_intents AS p
+        ON o.order_id = p.order_id
+      WHERE o.order_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
+      GROUP BY o.order_id
+      HAVING countIf(p.payment_intent_id != '') != 1
+    count: 0
     blocking: true
 columns:
   - name: payment_intent_id
-    type: varchar
-    description: "Stable identifier of the payment intent."
+    type: String
+    description: "Stable Stripe-style payment-intent identifier."
     primary_key: true
     checks:
-        - name: not_null
-        - name: unique
+      - name: not_null
+      - name: unique
   - name: order_id
-    type: integer
+    type: UInt64
     description: "Stable identifier of the order attempt."
+    checks:
+      - name: unique
   - name: customer_id
-    type: integer
+    type: UInt64
     description: "Stable identifier of the customer."
   - name: customer_email
-    type: varchar
-    description: "Email address associated with the customer or order."
+    type: String
+    description: "Synthetic customer email address."
+  - name: payment_date
+    type: Date
+    description: "Calendar date on which the payment intent was created."
   - name: created_at
-    type: datetime
-    description: "Timestamp when the payment intent was created."
+    type: DateTime('UTC')
+    description: "Timestamp at which the payment intent was created in UTC."
   - name: amount
-    type: float
-    description: "Monetary amount recorded on the payment intent."
+    type: Decimal(18, 2)
+    description: "Amount presented for payment in USD."
     checks:
       - name: non_negative
   - name: currency
-    type: varchar
-    description: "ISO currency code used for the payment amount."
+    type: LowCardinality(String)
+    description: "Uppercase ISO currency code."
     checks:
       - name: accepted_values
         value: ["USD"]
   - name: status
-    type: varchar
-    description: "Status reported by the payment intent."
+    type: LowCardinality(String)
+    description: "Stripe-style payment-intent status."
     checks:
       - name: accepted_values
         value: ["canceled", "succeeded"]
   - name: payment_method
-    type: varchar
-    description: "Payment method used to settle the payment intent."
+    type: LowCardinality(String)
+    description: "Synthetic payment method."
+    checks:
+      - name: accepted_values
+        value: ["apple_pay", "card", "paypal", "shop_pay"]
   - name: payment_fee_amount
-    type: float
-    description: "Processing fee charged for the payment intent."
+    type: Decimal(18, 2)
+    description: "Modeled processor fee in USD."
     checks:
       - name: non_negative
 @bruin */
 
 SELECT
-    concat('pi_', toString(order_id)) AS payment_intent_id,
+    concat('pi_', leftPad(toString(order_id), 12, '0')) AS payment_intent_id,
     order_id,
     customer_id,
     customer_email,
+    order_date AS payment_date,
     order_datetime AS created_at,
     total_amount AS amount,
-    'usd' AS currency,
-    multiIf(order_status = 'cancelled', 'canceled', 'succeeded') AS status,
-    arrayElement(['card', 'apple_pay', 'paypal', 'shop_pay'], toUInt32((cityHash64(toString(order_id), customer_email) % 4) + 1)) AS payment_method,
-    round(if(status = 'succeeded', total_amount * 0.029 + 0.30, 0.00), 2) AS payment_fee_amount
+    toLowCardinality('USD') AS currency,
+    toLowCardinality(multiIf(order_status = 'cancelled', 'canceled', 'succeeded')) AS status,
+    toLowCardinality(
+        arrayElement(
+            ['card', 'apple_pay', 'paypal', 'shop_pay'],
+            toUInt32((cityHash64(toString(order_id), customer_email, 'payment_method') % 4) + 1)
+        )
+    ) AS payment_method,
+    toDecimal64(
+        if(
+            status = 'succeeded',
+            toDecimal64(
+                amount * toDecimal64(0.029, 4) + toDecimal64(0.30, 2),
+                2
+            ),
+            toDecimal64(0, 2)
+        ),
+        2
+    ) AS payment_fee_amount
 FROM bruin_shop.t1_orders
 WHERE order_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-SETTINGS insert_deduplicate = 0
