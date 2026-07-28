@@ -1,171 +1,277 @@
 /* @bruin
 name: bruin_shop.t3_daily_revenue
 type: clickhouse.sql
-description: "T3 daily commerce mart covering orders, refunds, revenue, and contribution economics."
+description: "Daily Shopify order and revenue mart at UTC date and shop-currency grain."
+
 materialization:
   type: table
-  strategy: time_interval
-  incremental_key: revenue_date
-  time_granularity: date
+  strategy: merge
+
 depends:
   - bruin_shop.t2_orders
 
 tags:
   - t3
   - mart
+  - shopify
+  - revenue
 domains:
   - commerce
   - finance
 meta:
-  grain: one row per calendar date
+  grain: one row per UTC order date and shop currency
+  source_system: shopify
+  currency_scope: no currency conversion; every row contains exactly one shop currency
+  revenue_policy: completed non-test non-cancelled orders use Shopify current totals
+  refresh_strategy: primary-key merge that recomputes complete date-currency groups touched by changed orders
+  physical_design: unpartitioned at current scale; date-prefixed primary key supports ordered date access
+  data_classification: internal
 
 custom_checks:
-  - name: interval contains daily revenue
-    description: Ensures the requested interval contains daily commerce rows.
+  - name: recognized revenue reconciles
+    description: "Recognized revenue must equal current order value for the completed orders in each row."
     query: |
-      SELECT count() > 0
+      SELECT count()
       FROM bruin_shop.t3_daily_revenue
-      WHERE revenue_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-    value: 1
+      WHERE recognized_revenue_amount != current_order_amount
+    value: 0
     blocking: true
-  - name: daily order and margin arithmetic reconciles
-    description: Ensures order states and contribution economics balance at daily grain.
-    query: |
-      SELECT revenue_date
-      FROM bruin_shop.t3_daily_revenue
-      WHERE revenue_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-        AND (
-          order_attempts != successful_orders + cancelled_orders
-          OR gross_profit != net_revenue - recognized_cogs_amount
-          OR contribution_margin != gross_profit - recognized_shipping_cost - payment_fee_amount
-        )
-    count: 0
-    blocking: true
-
-unit_tests:
-  - name: aggregates successful order economics
-    inputs:
-      - asset: bruin_shop.t2_orders
-        rows:
-          - {order_id: 1, order_date: "2026-01-05", item_count: 2, is_successful_order: 1, is_cancelled_order: 0, has_refund: 1, gross_merchandise_amount: 100, discount_amount: 10, refund_amount: 20, net_revenue: 80, recognized_cogs_amount: 30, recognized_shipping_cost: 5, payment_fee_amount: 3, gross_profit: 50, contribution_margin: 42}
-    expected:
-      count: 1
-      rows:
-        - {order_attempts: 1, successful_orders: 1, cancelled_orders: 0, refunded_orders: 1, items_purchased: 2, net_revenue: 80, contribution_margin: 42, average_order_value: 80}
 
 columns:
-  - name: revenue_date
-    type: Date
-    description: "Calendar date represented by the revenue row."
+  - name: revenue_key
+    type: String
+    description: "Date-prefixed stable key composed of revenue date and currency."
     primary_key: true
     checks:
       - name: not_null
       - name: unique
+  - name: revenue_date
+    type: Date
+    description: "UTC calendar date when the represented orders were created."
+    checks:
+      - name: not_null
+  - name: revenue_month
+    type: Date
+    description: "First day of the UTC revenue month."
+  - name: currency
+    type: LowCardinality(String)
+    description: "ISO shop-currency code for every monetary value in the row."
+    checks:
+      - name: not_null
   - name: order_attempts
     type: UInt64
-    description: "Number of all order attempts."
-    checks:
-      - name: non_negative
-  - name: successful_orders
+    description: "Number of Shopify orders created on the date, including incomplete, cancelled, and test orders."
+  - name: completed_orders
     type: UInt64
-    description: "Number of successfully captured orders, including later refunds."
-    checks:
-      - name: non_negative
+    description: "Number of paid or refunded, non-test, non-cancelled orders."
   - name: cancelled_orders
     type: UInt64
-    description: "Number of cancelled order attempts."
-    checks:
-      - name: non_negative
+    description: "Number of orders with a Shopify cancellation timestamp."
+  - name: test_orders
+    type: UInt64
+    description: "Number of orders Shopify marks as tests."
   - name: refunded_orders
     type: UInt64
-    description: "Number of orders with a refund record."
-    checks:
-      - name: non_negative
-  - name: items_purchased
+    description: "Number of completed orders currently marked partially refunded or refunded."
+  - name: unique_customers
     type: UInt64
-    description: "Units on successfully captured orders."
-    checks:
-      - name: non_negative
-  - name: gross_merchandise_amount
+    description: "Distinct identified customers with completed orders; guest orders are excluded."
+  - name: gross_sales_amount
     type: Decimal(18, 2)
-    description: "Merchandise value before discounts on successfully captured orders."
+    description: "Original line-item value before discounts across completed orders."
     checks:
       - name: non_negative
   - name: discount_amount
     type: Decimal(18, 2)
-    description: "Discounts on successfully captured orders."
+    description: "Original discounts across completed orders."
     checks:
       - name: non_negative
-  - name: refund_amount
+  - name: subtotal_amount
     type: Decimal(18, 2)
-    description: "Amount returned to customers."
+    description: "Original post-discount subtotal across completed orders."
     checks:
       - name: non_negative
-  - name: net_revenue
+  - name: shipping_amount
     type: Decimal(18, 2)
-    description: "Captured order totals net of refunds."
+    description: "Original shipping amount across completed orders."
     checks:
       - name: non_negative
-  - name: recognized_cogs_amount
+  - name: tax_amount
     type: Decimal(18, 2)
-    description: "Product cost retained after cancellation and refund treatment."
+    description: "Original tax amount across completed orders."
     checks:
       - name: non_negative
-  - name: recognized_shipping_cost
+  - name: original_order_amount
     type: Decimal(18, 2)
-    description: "Fulfillment cost on successfully captured orders."
+    description: "Original total value across completed orders."
     checks:
       - name: non_negative
-  - name: payment_fee_amount
+  - name: current_order_amount
     type: Decimal(18, 2)
-    description: "Payment-processing fees on the day's order attempts."
+    description: "Current total value across completed orders after returns, refunds, and edits."
     checks:
       - name: non_negative
-  - name: gross_profit
+  - name: refunded_amount
     type: Decimal(18, 2)
-    description: "Net revenue less recognized product cost."
-  - name: contribution_margin
+    description: "Non-negative reduction from original to current totals across completed orders."
+    checks:
+      - name: non_negative
+  - name: outstanding_amount
     type: Decimal(18, 2)
-    description: "Gross profit less fulfillment and payment-processing costs, before media spend."
+    description: "Amount Shopify reports as still owed across non-test, non-cancelled order attempts."
+    checks:
+      - name: non_negative
+  - name: recognized_revenue_amount
+    type: Decimal(18, 2)
+    description: "Current total recognized for completed, non-test, non-cancelled orders."
+    checks:
+      - name: non_negative
   - name: average_order_value
     type: Decimal(18, 2)
-    description: "Net revenue divided by successfully captured orders."
+    description: "Recognized revenue divided by completed order count."
     checks:
       - name: non_negative
-  - name: refund_rate
+  - name: completion_rate
     type: Float64
-    description: "Orders with refunds divided by successfully captured orders."
+    description: "Completed orders divided by all order attempts."
     checks:
       - name: min
         value: 0
       - name: max
         value: 1
+  - name: refund_rate
+    type: Float64
+    description: "Refunded completed orders divided by completed orders."
+    checks:
+      - name: min
+        value: 0
+      - name: max
+        value: 1
+  - name: source_max_updated_at
+    type: DateTime64(6, 'UTC')
+    description: "Latest Shopify order update timestamp contributing to the row."
 @bruin */
 
+WITH changed_daily_keys AS (
+    SELECT DISTINCT
+        o.order_date,
+        o.currency
+    FROM bruin_shop.t2_orders AS o
+    WHERE o.order_updated_at BETWEEN
+        parseDateTime64BestEffort('{{ start_timestamp }}', 6, 'UTC')
+        AND parseDateTime64BestEffort('{{ end_timestamp }}', 6, 'UTC')
+),
+daily AS (
+    SELECT
+        o.order_date AS revenue_date,
+        o.currency AS currency,
+        count() AS order_attempts,
+        countIf(o.is_completed_order = 1) AS completed_orders,
+        countIf(o.is_cancelled_order = 1) AS cancelled_orders,
+        countIf(o.is_test_order = 1) AS test_orders,
+        countIf(o.is_completed_order = 1 AND o.is_refunded_order = 1) AS refunded_orders,
+        uniqExactIf(o.customer_id, o.is_completed_order = 1 AND o.customer_id IS NOT NULL) AS unique_customers,
+        toDecimal64(
+            sumIf(o.gross_sales_amount, o.is_completed_order = 1),
+            2
+        ) AS gross_sales_amount,
+        toDecimal64(
+            sumIf(o.discount_amount, o.is_completed_order = 1),
+            2
+        ) AS discount_amount,
+        toDecimal64(
+            sumIf(o.subtotal_amount, o.is_completed_order = 1),
+            2
+        ) AS subtotal_amount,
+        toDecimal64(
+            sumIf(o.shipping_amount, o.is_completed_order = 1),
+            2
+        ) AS shipping_amount,
+        toDecimal64(
+            sumIf(o.tax_amount, o.is_completed_order = 1),
+            2
+        ) AS tax_amount,
+        toDecimal64(
+            sumIf(o.original_total_amount, o.is_completed_order = 1),
+            2
+        ) AS original_order_amount,
+        toDecimal64(
+            sumIf(o.current_total_amount, o.is_completed_order = 1),
+            2
+        ) AS current_order_amount,
+        toDecimal64(
+            sumIf(o.refunded_amount, o.is_completed_order = 1),
+            2
+        ) AS refunded_amount,
+        toDecimal64(
+            sumIf(
+                o.outstanding_amount,
+                o.is_test_order = 0 AND o.is_cancelled_order = 0
+            ),
+            2
+        ) AS outstanding_amount,
+        toDecimal64(
+            sum(o.recognized_revenue_amount),
+            2
+        ) AS recognized_revenue_amount,
+        max(
+            ifNull(
+                o.order_updated_at,
+                toDateTime64('1970-01-01 00:00:00', 6, 'UTC')
+            )
+        ) AS source_max_updated_at
+    FROM bruin_shop.t2_orders AS o
+    INNER JOIN changed_daily_keys AS changed
+        ON o.order_date = changed.order_date
+        AND o.currency = changed.currency
+    GROUP BY
+        o.order_date,
+        o.currency
+)
 SELECT
-    order_date AS revenue_date,
-    count() AS order_attempts,
-    countIf(is_successful_order = 1) AS successful_orders,
-    countIf(is_cancelled_order = 1) AS cancelled_orders,
-    countIf(has_refund = 1) AS refunded_orders,
-    sumIf(toUInt64(item_count), is_successful_order = 1) AS items_purchased,
-    toDecimal64(sumIf(gross_merchandise_amount, is_successful_order = 1), 2) AS gross_merchandise_amount,
-    toDecimal64(sumIf(discount_amount, is_successful_order = 1), 2) AS discount_amount,
-    toDecimal64(sum(refund_amount), 2) AS refund_amount,
-    toDecimal64(sum(net_revenue), 2) AS net_revenue,
-    toDecimal64(sum(recognized_cogs_amount), 2) AS recognized_cogs_amount,
-    toDecimal64(sum(recognized_shipping_cost), 2) AS recognized_shipping_cost,
-    toDecimal64(sum(payment_fee_amount), 2) AS payment_fee_amount,
-    toDecimal64(sum(gross_profit), 2) AS gross_profit,
-    toDecimal64(sum(contribution_margin), 2) AS contribution_margin,
+    concat(toString(d.revenue_date), '|', d.currency) AS revenue_key,
+    d.revenue_date,
+    toStartOfMonth(d.revenue_date) AS revenue_month,
+    d.currency,
+    d.order_attempts,
+    d.completed_orders,
+    d.cancelled_orders,
+    d.test_orders,
+    d.refunded_orders,
+    d.unique_customers,
+    d.gross_sales_amount,
+    d.discount_amount,
+    d.subtotal_amount,
+    d.shipping_amount,
+    d.tax_amount,
+    d.original_order_amount,
+    d.current_order_amount,
+    d.refunded_amount,
+    d.outstanding_amount,
+    d.recognized_revenue_amount,
     toDecimal64(
-        if(successful_orders = 0, 0, toFloat64(net_revenue) / toFloat64(successful_orders)),
+        if(
+            d.completed_orders = 0,
+            0,
+            d.recognized_revenue_amount / d.completed_orders
+        ),
         2
     ) AS average_order_value,
     round(
-        if(successful_orders = 0, 0, toFloat64(refunded_orders) / toFloat64(successful_orders)),
+        if(
+            d.order_attempts = 0,
+            0,
+            toFloat64(d.completed_orders) / toFloat64(d.order_attempts)
+        ),
         4
-    ) AS refund_rate
-FROM bruin_shop.t2_orders
-WHERE order_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-GROUP BY order_date
+    ) AS completion_rate,
+    round(
+        if(
+            d.completed_orders = 0,
+            0,
+            toFloat64(d.refunded_orders) / toFloat64(d.completed_orders)
+        ),
+        4
+    ) AS refund_rate,
+    d.source_max_updated_at
+FROM daily AS d

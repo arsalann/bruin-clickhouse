@@ -1,11 +1,11 @@
 # Bruin ClickHouse Examples
 
-This repository contains Bruin pipelines that materialize demo data into ClickHouse.
+This repository contains Bruin pipelines that materialize data into ClickHouse.
 
 ## Pipelines
 
 - `bruin-clickhouse-101`: a small customer/order tutorial pipeline.
-- `bruin-shop-clickhouse`: a production-style Shopify analytics showcase with synthetic source contracts (T1), conformed models (T2), and analytical marts (T3).
+- `bruin-shop-clickhouse`: a live Shopify pipeline using ingestr source assets (T1), conformed models (T2), and Shopify-only analytical marts (T3).
 
 Run from the repository root:
 

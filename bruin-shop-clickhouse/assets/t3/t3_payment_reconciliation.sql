@@ -1,191 +1,211 @@
 /* @bruin
 name: bruin_shop.t3_payment_reconciliation
 type: clickhouse.sql
-description: "T3 daily reconciliation of order attempts, payment intents, captured amounts, and refunds."
+description: "Daily Shopify order financial-status and amount reconciliation at UTC date and currency grain."
+
 materialization:
   type: table
-  strategy: time_interval
-  incremental_key: reconciliation_date
-  time_granularity: date
+  strategy: merge
+
 depends:
   - bruin_shop.t2_orders
-  - bruin_shop.t1_payment_intents
-  - bruin_shop.t1_refunds
 
 tags:
   - t3
   - mart
+  - shopify
+  - payments
+  - reconciliation
 domains:
+  - commerce
   - finance
 meta:
-  grain: one row per calendar date
+  grain: one row per UTC order date and shop currency
+  source_system: shopify orders
+  currency_scope: no currency conversion; every row contains exactly one shop currency
+  reconciliation_scope: Shopify order financial statuses and order-header amounts
+  transaction_scope: no gateway settlement or balance transaction ledger is available from this shop connection
+  refresh_strategy: primary-key merge that recomputes complete date-currency groups touched by changed orders
+  physical_design: unpartitioned at current scale; date-prefixed primary key supports ordered date access
+  data_classification: internal
 
 custom_checks:
-  - name: interval contains reconciliation rows
-    description: Ensures the requested interval contains daily reconciliation rows.
+  - name: financial status buckets reconcile
+    description: "Every order must fall into exactly one declared financial-status bucket."
     query: |
-      SELECT count() > 0
+      SELECT count()
       FROM bruin_shop.t3_payment_reconciliation
-      WHERE reconciliation_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-    value: 1
+      WHERE order_attempts !=
+        pending_orders
+        + authorized_orders
+        + partially_paid_orders
+        + paid_orders
+        + partially_refunded_orders
+        + refunded_orders
+        + voided_orders
+        + other_status_orders
+    value: 0
     blocking: true
-  - name: daily payments and refunds reconcile
-    description: Ensures order counts, captured amounts, and refunds agree with provider-style records.
+  - name: recognized amount reconciles
+    description: "Recognized revenue must equal current totals for completed non-test non-cancelled orders."
     query: |
-      SELECT reconciliation_date
+      SELECT count()
       FROM bruin_shop.t3_payment_reconciliation
-      WHERE reconciliation_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-        AND (
-          payment_intent_count_gap != 0
-          OR succeeded_payment_count_gap != 0
-          OR succeeded_payment_amount_gap != 0
-          OR refund_record_count_gap != 0
-          OR refund_amount_gap != 0
-        )
-    count: 0
+      WHERE recognized_revenue_amount != completed_current_amount
+    value: 0
     blocking: true
 
 columns:
-  - name: reconciliation_date
-    type: Date
-    description: "Calendar date represented by the reconciliation row."
+  - name: reconciliation_key
+    type: String
+    description: "Date-prefixed stable key composed of reconciliation date and currency."
     primary_key: true
     checks:
       - name: not_null
       - name: unique
+  - name: reconciliation_date
+    type: Date
+    description: "UTC calendar date when the represented orders were created."
+  - name: reconciliation_month
+    type: Date
+    description: "First day of the UTC reconciliation month."
+  - name: currency
+    type: LowCardinality(String)
+    description: "ISO shop-currency code for every monetary value in the row."
   - name: order_attempts
     type: UInt64
-    description: "Number of all order attempts."
-  - name: cancelled_orders
+    description: "Number of Shopify order records created on the date."
+  - name: pending_orders
     type: UInt64
-    description: "Number of cancelled order attempts."
-  - name: successful_orders
+    description: "Orders whose current Shopify financial status is pending."
+  - name: authorized_orders
     type: UInt64
-    description: "Number of successfully captured orders."
-  - name: payment_intents
+    description: "Orders whose current Shopify financial status is authorized."
+  - name: partially_paid_orders
     type: UInt64
-    description: "Number of payment intents."
-  - name: succeeded_payment_intents
+    description: "Orders whose current Shopify financial status is partially paid."
+  - name: paid_orders
     type: UInt64
-    description: "Number of succeeded payment intents."
-  - name: canceled_payment_intents
+    description: "Orders whose current Shopify financial status is paid."
+  - name: partially_refunded_orders
     type: UInt64
-    description: "Number of canceled payment intents."
-  - name: payment_intent_count_gap
-    type: Int64
-    description: "Order attempts minus payment intents."
-  - name: succeeded_payment_count_gap
-    type: Int64
-    description: "Successfully captured orders minus succeeded payment intents."
-  - name: successful_order_amount
-    type: Decimal(18, 2)
-    description: "Payment amount on successfully captured orders."
-    checks:
-      - name: non_negative
-  - name: succeeded_payment_amount
-    type: Decimal(18, 2)
-    description: "Amount on succeeded payment intents."
-    checks:
-      - name: non_negative
-  - name: succeeded_payment_amount_gap
-    type: Decimal(18, 2)
-    description: "Successful-order payment amount minus succeeded-intent amount."
+    description: "Orders whose current Shopify financial status is partially refunded."
   - name: refunded_orders
     type: UInt64
-    description: "Number of orders with refund records."
-  - name: provider_refund_records
+    description: "Orders whose current Shopify financial status is refunded."
+  - name: voided_orders
     type: UInt64
-    description: "Number of provider-style refund records."
-  - name: refund_record_count_gap
-    type: Int64
-    description: "Refunded orders minus provider-style refund records."
-  - name: order_refund_amount
+    description: "Orders whose current Shopify financial status is voided."
+  - name: other_status_orders
+    type: UInt64
+    description: "Orders with a missing or non-standard Shopify financial status."
+  - name: test_orders
+    type: UInt64
+    description: "Orders Shopify marks as tests, independently of financial status."
+  - name: cancelled_orders
+    type: UInt64
+    description: "Orders with a Shopify cancellation timestamp, independently of financial status."
+  - name: original_order_amount
     type: Decimal(18, 2)
-    description: "Refund amount carried on conformed orders."
+    description: "Original total value across all represented order attempts."
     checks:
       - name: non_negative
-  - name: provider_refund_amount
+  - name: current_order_amount
     type: Decimal(18, 2)
-    description: "Refund amount from provider-style records."
+    description: "Current total value across all represented order attempts."
     checks:
       - name: non_negative
-  - name: refund_amount_gap
+  - name: completed_current_amount
     type: Decimal(18, 2)
-    description: "Conformed-order refunds minus provider-style refunds."
+    description: "Current total value across completed, non-test, non-cancelled orders."
+    checks:
+      - name: non_negative
+  - name: refunded_amount
+    type: Decimal(18, 2)
+    description: "Non-negative reduction from original to current totals across completed orders."
+    checks:
+      - name: non_negative
+  - name: outstanding_amount
+    type: Decimal(18, 2)
+    description: "Amount Shopify reports as still owed across non-test, non-cancelled orders."
+    checks:
+      - name: non_negative
+  - name: recognized_revenue_amount
+    type: Decimal(18, 2)
+    description: "Current total recognized for completed, non-test, non-cancelled orders."
+    checks:
+      - name: non_negative
+  - name: source_max_updated_at
+    type: DateTime64(6, 'UTC')
+    description: "Latest Shopify order update timestamp contributing to the row."
 @bruin */
 
-WITH
-    orders AS (
-        SELECT
-            order_date AS reconciliation_date,
-            count() AS order_attempts,
-            countIf(is_cancelled_order = 1) AS cancelled_orders,
-            countIf(is_successful_order = 1) AS successful_orders,
-            toDecimal64(sumIf(payment_amount, is_successful_order = 1), 2) AS successful_order_amount,
-            countIf(has_refund = 1) AS refunded_orders,
-            toDecimal64(sum(refund_amount), 2) AS order_refund_amount
-        FROM bruin_shop.t2_orders
-        WHERE order_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-        GROUP BY order_date
-    ),
-    payments AS (
-        SELECT
-            payment_date AS reconciliation_date,
-            count() AS payment_intents,
-            countIf(status = 'succeeded') AS succeeded_payment_intents,
-            countIf(status = 'canceled') AS canceled_payment_intents,
-            toDecimal64(sumIf(amount, status = 'succeeded'), 2) AS succeeded_payment_amount
-        FROM bruin_shop.t1_payment_intents
-        WHERE payment_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-        GROUP BY payment_date
-    ),
-    refunds AS (
-        SELECT
-            order_date AS reconciliation_date,
-            count() AS provider_refund_records,
-            toDecimal64(sum(refund_amount), 2) AS provider_refund_amount
-        FROM bruin_shop.t1_refunds
-        WHERE order_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-        GROUP BY order_date
-    ),
-    joined AS (
-        SELECT
-            o.reconciliation_date AS reconciliation_date,
-            o.order_attempts AS order_attempts,
-            o.cancelled_orders AS cancelled_orders,
-            o.successful_orders AS successful_orders,
-            o.successful_order_amount AS successful_order_amount,
-            o.refunded_orders AS refunded_orders,
-            o.order_refund_amount AS order_refund_amount,
-            ifNull(p.payment_intents, toUInt64(0)) AS payment_intents,
-            ifNull(p.succeeded_payment_intents, toUInt64(0)) AS succeeded_payment_intents,
-            ifNull(p.canceled_payment_intents, toUInt64(0)) AS canceled_payment_intents,
-            ifNull(p.succeeded_payment_amount, toDecimal64(0, 2)) AS succeeded_payment_amount,
-            ifNull(r.provider_refund_records, toUInt64(0)) AS provider_refund_records,
-            ifNull(r.provider_refund_amount, toDecimal64(0, 2)) AS provider_refund_amount
-        FROM orders AS o
-        LEFT JOIN payments AS p
-            ON o.reconciliation_date = p.reconciliation_date
-        LEFT JOIN refunds AS r
-            ON o.reconciliation_date = r.reconciliation_date
-    )
+WITH changed_reconciliation_keys AS (
+    SELECT DISTINCT
+        o.order_date,
+        o.currency
+    FROM bruin_shop.t2_orders AS o
+    WHERE o.order_updated_at BETWEEN
+        parseDateTime64BestEffort('{{ start_timestamp }}', 6, 'UTC')
+        AND parseDateTime64BestEffort('{{ end_timestamp }}', 6, 'UTC')
+)
 SELECT
-    reconciliation_date,
-    order_attempts,
-    cancelled_orders,
-    successful_orders,
-    payment_intents,
-    succeeded_payment_intents,
-    canceled_payment_intents,
-    toInt64(order_attempts) - toInt64(payment_intents) AS payment_intent_count_gap,
-    toInt64(successful_orders) - toInt64(succeeded_payment_intents) AS succeeded_payment_count_gap,
-    successful_order_amount,
-    succeeded_payment_amount,
-    toDecimal64(successful_order_amount - succeeded_payment_amount, 2) AS succeeded_payment_amount_gap,
-    refunded_orders,
-    provider_refund_records,
-    toInt64(refunded_orders) - toInt64(provider_refund_records) AS refund_record_count_gap,
-    order_refund_amount,
-    provider_refund_amount,
-    toDecimal64(order_refund_amount - provider_refund_amount, 2) AS refund_amount_gap
-FROM joined
+    concat(toString(o.order_date), '|', o.currency) AS reconciliation_key,
+    o.order_date AS reconciliation_date,
+    toStartOfMonth(o.order_date) AS reconciliation_month,
+    o.currency,
+    count() AS order_attempts,
+    countIf(o.financial_status = 'pending') AS pending_orders,
+    countIf(o.financial_status = 'authorized') AS authorized_orders,
+    countIf(o.financial_status = 'partially_paid') AS partially_paid_orders,
+    countIf(o.financial_status = 'paid') AS paid_orders,
+    countIf(o.financial_status = 'partially_refunded') AS partially_refunded_orders,
+    countIf(o.financial_status = 'refunded') AS refunded_orders,
+    countIf(o.financial_status = 'voided') AS voided_orders,
+    countIf(
+        o.financial_status NOT IN (
+            'pending',
+            'authorized',
+            'partially_paid',
+            'paid',
+            'partially_refunded',
+            'refunded',
+            'voided'
+        )
+    ) AS other_status_orders,
+    countIf(o.is_test_order = 1) AS test_orders,
+    countIf(o.is_cancelled_order = 1) AS cancelled_orders,
+    toDecimal64(sum(o.original_total_amount), 2) AS original_order_amount,
+    toDecimal64(sum(o.current_total_amount), 2) AS current_order_amount,
+    toDecimal64(
+        sumIf(o.current_total_amount, o.is_completed_order = 1),
+        2
+    ) AS completed_current_amount,
+    toDecimal64(
+        sumIf(o.refunded_amount, o.is_completed_order = 1),
+        2
+    ) AS refunded_amount,
+    toDecimal64(
+        sumIf(
+            o.outstanding_amount,
+            o.is_test_order = 0 AND o.is_cancelled_order = 0
+        ),
+        2
+    ) AS outstanding_amount,
+    toDecimal64(
+        sum(o.recognized_revenue_amount),
+        2
+    ) AS recognized_revenue_amount,
+    max(
+        ifNull(
+            o.order_updated_at,
+            toDateTime64('1970-01-01 00:00:00', 6, 'UTC')
+        )
+    ) AS source_max_updated_at
+FROM bruin_shop.t2_orders AS o
+INNER JOIN changed_reconciliation_keys AS changed
+    ON o.order_date = changed.order_date
+    AND o.currency = changed.currency
+GROUP BY
+    o.order_date,
+    o.currency

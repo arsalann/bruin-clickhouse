@@ -1,6 +1,6 @@
 name: bruin-shop-clickhouse
 schedule: "@daily"
-start_date: "2025-01-01"
+start_date: "2006-01-01"
 catchup: false
 
 default_connections:
@@ -9,15 +9,20 @@ default_connections:
 tags:
     - clickhouse
     - ecommerce
-    - showcase
-    - synthetic
+    - shopify
+    - ingestr
 
 domains:
     - commerce
     - finance
-    - marketing
+    - customer
+    - merchandising
+    - fulfillment
 
 meta:
-    description: "Self-contained Shopify analytics warehouse showcase for Bruin and ClickHouse."
-    data_classification: synthetic
-    source_mode: self-contained-demo
+    description: "Live Shopify analytics warehouse ingested with ingestr and modeled in ClickHouse."
+    data_classification: mixed
+    source_mode: live-shopify
+    source_connection: shopify
+    reporting_timezone: UTC
+    currency_policy: no conversion; monetary aggregates remain at shop-currency grain

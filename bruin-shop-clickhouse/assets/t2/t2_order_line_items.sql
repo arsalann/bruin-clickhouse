@@ -1,334 +1,294 @@
 /* @bruin
 name: bruin_shop.t2_order_line_items
 type: clickhouse.sql
-description: "Conformed T2 order lines with proportional refunds and product-level margin."
+description: "Conformed Shopify order lines parsed from the nested order payload."
+
 materialization:
   type: table
-  strategy: time_interval
-  incremental_key: order_date
-  time_granularity: date
+  strategy: merge
+
 depends:
-  - bruin_shop.t1_order_line_items
+  - bruin_shop.t1_orders
   - bruin_shop.t2_orders
 
 tags:
   - t2
   - conformed
+  - shopify
+  - order-lines
 domains:
   - commerce
   - finance
+  - merchandising
 meta:
-  grain: one row per order line
-  source_system: conformed_shopify_stripe
+  grain: one row per Shopify order line item
+  source_system: shopify
+  currency_scope: monetary values remain in each order's shop currency
+  refund_policy: recognized line revenue allocates the order's current subtotal proportionally across original net line values
+  refresh_strategy: primary-key merge for lines belonging to orders updated in the run interval
+  data_classification: internal
 
 custom_checks:
-  - name: interval contains conformed lines
-    description: Ensures the requested interval contains standardized order-line rows.
+  - name: excluded orders have no recognized line revenue
+    description: "Ensures lines from cancelled, test, and incomplete orders do not contribute recognized merchandise revenue."
     query: |
-      SELECT count() > 0
+      SELECT count()
       FROM bruin_shop.t2_order_line_items
-      WHERE order_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-    value: 1
+      WHERE is_completed_order = 0
+        AND recognized_line_revenue_amount != 0
+    value: 0
     blocking: true
-  - name: line refunds reconcile to orders
-    description: Ensures line-level refund allocation sums exactly to the order merchandise refund.
+  - name: line totals reconcile to order headers
+    description: "Ensures line gross sales and discounts reconcile to Shopify order-header totals."
     query: |
-      SELECT l.order_id
-      FROM bruin_shop.t2_order_line_items AS l
-      INNER JOIN bruin_shop.t2_orders AS o
-        ON l.order_id = o.order_id
-      WHERE l.order_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-      GROUP BY l.order_id, o.refunded_merchandise_amount
-      HAVING sum(l.allocated_refund_amount) != o.refunded_merchandise_amount
-    count: 0
+      WITH line_totals AS (
+          SELECT
+              order_id,
+              sum(gross_sales_amount) AS gross_sales_amount,
+              sum(discount_amount) AS discount_amount
+          FROM bruin_shop.t2_order_line_items
+          GROUP BY order_id
+      )
+      SELECT count()
+      FROM bruin_shop.t2_orders AS o
+      INNER JOIN line_totals AS l USING (order_id)
+      WHERE abs(o.gross_sales_amount - l.gross_sales_amount) > 0.01
+         OR abs(o.discount_amount - l.discount_amount) > 0.01
+    value: 0
     blocking: true
-  - name: line economics reconcile
-    description: Ensures each line's net merchandise and gross profit calculations balance.
+  - name: recognized line revenue reconciles to current merchandise subtotal
+    description: "Ensures proportional line allocations reconcile to completed orders' current subtotals within cent-rounding tolerance."
     query: |
-      SELECT line_item_id
-      FROM bruin_shop.t2_order_line_items
-      WHERE order_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-        AND (
-          net_merchandise_revenue
-            != if(
-              is_successful_order = 1,
-              line_net_merchandise_before_refund - allocated_refund_amount,
-              toDecimal64(0, 2)
-            )
-          OR gross_profit != net_merchandise_revenue - recognized_cogs_amount
-        )
-    count: 0
+      WITH line_totals AS (
+          SELECT
+              order_id,
+              sum(recognized_line_revenue_amount) AS recognized_line_revenue_amount,
+              count() AS line_count
+          FROM bruin_shop.t2_order_line_items
+          GROUP BY order_id
+      )
+      SELECT count()
+      FROM bruin_shop.t2_orders AS o
+      INNER JOIN line_totals AS l USING (order_id)
+      WHERE o.is_completed_order = 1
+        AND abs(o.current_subtotal_amount - l.recognized_line_revenue_amount)
+            > greatest(toDecimal64(0.01, 2), toDecimal64(l.line_count * 0.01, 2))
+    value: 0
     blocking: true
-
-unit_tests:
-  - name: allocates refund to a product line
-    inputs:
-      - asset: bruin_shop.t1_order_line_items
-        rows:
-          - {line_item_id: 11, order_id: 1, order_date: "2026-01-05", market_id: "NY-new-york", market_index: 3, state: "NY", city: "New York", channel: "paid_search", event_id: "none", campaign_id: "google_always_on", customer_id: 10, line_number: 1, product_id: "prod_a", product_name: "Product A", product_category: "tshirts", sku: "A", quantity: 1, unit_price: 100, gross_merchandise_amount: 100, discount_amount: 10, net_merchandise_amount: 90, unit_cogs: 42, cogs_amount: 42}
-      - asset: bruin_shop.t2_orders
-        rows:
-          - {order_id: 1, order_status: "partially_refunded", financial_status: "partially_refunded", fulfillment_status: "fulfilled", is_successful_order: 1, is_cancelled_order: 0, has_refund: 1, net_merchandise_before_refund: 90, refunded_merchandise_amount: 27}
-    expected:
-      count: 1
-      rows:
-        - {line_item_id: 11, allocated_refund_amount: 27, net_merchandise_revenue: 63, recognized_cogs_amount: 29.40, gross_profit: 33.60}
 
 columns:
-  - name: line_item_id
-    type: UInt64
-    description: "Stable identifier of the order line."
+  - name: line_item_key
+    type: String
+    description: "Date-prefixed stable key used as the ClickHouse primary and sorting key."
     primary_key: true
     checks:
       - name: not_null
       - name: unique
+  - name: line_item_id
+    type: Int64
+    description: "Shopify numeric identifier for the order line item."
+    checks:
+      - name: not_null
+      - name: unique
   - name: order_id
-    type: UInt64
-    description: "Stable identifier of the order attempt."
+    type: Int64
+    description: "Shopify numeric identifier for the parent order."
   - name: order_date
     type: Date
-    description: "Calendar date on which the order was placed."
-  - name: market_id
-    type: String
-    description: "Stable identifier of the city market."
-  - name: market_index
-    type: UInt8
-    description: "Stable numeric market ordering."
-  - name: state
-    type: LowCardinality(String)
-    description: "Two-letter US state code."
-  - name: city
-    type: LowCardinality(String)
-    description: "City represented by the market."
-  - name: channel
-    type: LowCardinality(String)
-    description: "Normalized acquisition channel."
-  - name: event_id
-    type: LowCardinality(String)
-    description: "Campaign or operational scenario active for the order."
-  - name: campaign_id
-    type: LowCardinality(String)
-    description: "Campaign or non-paid source identifier."
+    description: "UTC calendar date when the parent order was created."
+  - name: order_month
+    type: Date
+    description: "First day of the UTC order month."
+  - name: order_updated_at
+    type: Nullable(DateTime64(6, 'UTC'))
+    description: "Timestamp when Shopify last updated the parent order."
   - name: customer_id
-    type: UInt64
-    description: "Stable identifier of the customer."
-  - name: line_number
-    type: UInt8
-    description: "One-based line position within the order."
-    checks:
-      - name: positive
+    type: Nullable(Int64)
+    description: "Shopify numeric customer identifier from the parent order."
+  - name: currency
+    type: LowCardinality(String)
+    description: "ISO shop-currency code for monetary measures."
+  - name: source_name
+    type: LowCardinality(String)
+    description: "Shopify order source or sales channel."
   - name: product_id
     type: String
-    description: "Stable identifier of the product."
-  - name: product_name
-    type: String
-    description: "Display name of the product."
-  - name: product_category
-    type: LowCardinality(String)
-    description: "Merchandise category of the product."
+    description: "Shopify Admin GraphQL global identifier for the product, or blank for deleted/custom products."
+  - name: product_legacy_id
+    type: UInt64
+    description: "Legacy numeric Shopify product identifier."
+  - name: variant_legacy_id
+    type: UInt64
+    description: "Legacy numeric Shopify product variant identifier."
   - name: sku
     type: String
-    description: "Stock-keeping unit of the product."
+    description: "Stock-keeping unit recorded on the order line."
+  - name: product_title
+    type: String
+    description: "Product title recorded when the order was placed."
+  - name: variant_title
+    type: String
+    description: "Variant title recorded when the order was placed."
+  - name: vendor
+    type: LowCardinality(String)
+    description: "Product vendor recorded on the order line."
   - name: quantity
-    type: UInt8
-    description: "Units on the order line."
+    type: Int64
+    description: "Original quantity ordered."
     checks:
       - name: positive
+  - name: current_quantity
+    type: Int64
+    description: "Current quantity after order edits and removals."
   - name: unit_price
     type: Decimal(18, 2)
-    description: "Catalog unit price in USD."
+    description: "Unit price recorded on the line in shop currency."
     checks:
-      - name: positive
-  - name: gross_merchandise_amount
+      - name: non_negative
+  - name: gross_sales_amount
     type: Decimal(18, 2)
-    description: "Line merchandise value before discounts."
+    description: "Unit price multiplied by original quantity."
     checks:
       - name: non_negative
   - name: discount_amount
     type: Decimal(18, 2)
-    description: "Discount allocated directly to the line."
+    description: "Total discount allocated by Shopify to the line."
     checks:
       - name: non_negative
-  - name: line_net_merchandise_before_refund
+  - name: net_line_amount
     type: Decimal(18, 2)
-    description: "Line merchandise value after discounts and before refunds."
-    checks:
-      - name: non_negative
-  - name: unit_cogs
+    description: "Gross line sales less Shopify line discounts."
+  - name: recognized_line_revenue_amount
     type: Decimal(18, 2)
-    description: "Standard unit cost in USD."
-    checks:
-      - name: non_negative
-  - name: cogs_amount
-    type: Decimal(18, 2)
-    description: "Standard product cost before refund treatment."
-    checks:
-      - name: non_negative
-  - name: order_status
-    type: LowCardinality(String)
-    description: "Lifecycle state of the parent order."
-  - name: financial_status
-    type: LowCardinality(String)
-    description: "Financial state of the parent order."
-  - name: fulfillment_status
-    type: LowCardinality(String)
-    description: "Fulfillment state of the parent order."
-  - name: is_successful_order
+    description: "Completed order's current subtotal allocated to the line in proportion to its original net line value."
+  - name: is_completed_order
     type: UInt8
-    description: "Whether payment was captured and the parent order was not cancelled."
-  - name: is_cancelled_order
+    description: "One when the parent order qualifies as completed."
+  - name: is_refunded_order
     type: UInt8
-    description: "Whether the parent order was cancelled."
-  - name: has_refund
-    type: UInt8
-    description: "Whether the parent order has a refund."
-  - name: allocated_refund_amount
-    type: Decimal(18, 2)
-    description: "Order merchandise refund allocated proportionally to this line."
-    checks:
-      - name: non_negative
-  - name: net_merchandise_revenue
-    type: Decimal(18, 2)
-    description: "Line merchandise value after discounts and allocated refunds."
-    checks:
-      - name: non_negative
-  - name: recognized_cogs_amount
-    type: Decimal(18, 2)
-    description: "Product cost retained after cancellation and refund treatment."
-    checks:
-      - name: non_negative
-  - name: gross_profit
-    type: Decimal(18, 2)
-    description: "Net merchandise revenue less recognized product cost."
+    description: "One when Shopify reports the parent order as partially refunded or refunded."
+  - name: requires_shipping
+    type: Bool
+    description: "Whether the order line requires shipping."
+  - name: taxable
+    type: Bool
+    description: "Whether the order line is taxable."
+  - name: is_gift_card
+    type: Bool
+    description: "Whether the order line represents a gift card."
 @bruin */
 
-WITH
-    weighted AS (
-        SELECT
-            l.line_item_id AS line_item_id,
-            l.order_id AS order_id,
-            l.order_date AS order_date,
-            l.market_id AS market_id,
-            l.market_index AS market_index,
-            l.state AS state,
-            l.city AS city,
-            l.channel AS channel,
-            l.event_id AS event_id,
-            l.campaign_id AS campaign_id,
-            l.customer_id AS customer_id,
-            l.line_number AS line_number,
-            l.product_id AS product_id,
-            l.product_name AS product_name,
-            l.product_category AS product_category,
-            l.sku AS sku,
-            l.quantity AS quantity,
-            l.unit_price AS unit_price,
-            l.gross_merchandise_amount AS gross_merchandise_amount,
-            l.discount_amount AS discount_amount,
-            l.net_merchandise_amount AS net_merchandise_amount,
-            l.unit_cogs AS unit_cogs,
-            l.cogs_amount AS cogs_amount,
-            o.order_status AS order_status,
-            o.financial_status AS financial_status,
-            o.fulfillment_status AS fulfillment_status,
-            o.is_successful_order AS is_successful_order,
-            o.is_cancelled_order AS is_cancelled_order,
-            o.has_refund AS has_refund,
-            o.refunded_merchandise_amount AS refunded_merchandise_amount,
-            toInt64(o.refunded_merchandise_amount * 100) AS refund_cents,
-            toInt64(o.net_merchandise_before_refund * 100) AS order_merchandise_cents,
-            sum(toInt64(l.net_merchandise_amount * 100)) OVER (
-                PARTITION BY l.order_id
-                ORDER BY l.line_number
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            ) AS cumulative_line_cents,
-            sum(toInt64(l.net_merchandise_amount * 100)) OVER (
-                PARTITION BY l.order_id
-                ORDER BY l.line_number
-                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-            ) AS prior_cumulative_line_cents
-        FROM bruin_shop.t1_order_line_items AS l
-        INNER JOIN bruin_shop.t2_orders AS o
-            ON l.order_id = o.order_id
-        WHERE l.order_date BETWEEN toDate('{{ start_date }}') AND toDate('{{ end_date }}')
-    ),
-    allocated AS (
-        SELECT
-            *,
-            toDecimal64(
-                toDecimal64(
-                    if(
-                        is_successful_order = 1 AND order_merchandise_cents > 0,
-                        intDiv(refund_cents * cumulative_line_cents, order_merchandise_cents)
-                            - intDiv(refund_cents * prior_cumulative_line_cents, order_merchandise_cents),
-                        0
-                    ),
-                    2
-                ) / toDecimal64(100, 2),
-                2
-            ) AS allocated_refund_amount
-        FROM weighted
-    ),
-    netted AS (
-        SELECT
-            *,
-            toDecimal64(
-                if(
-                    is_successful_order = 1,
-                    net_merchandise_amount - allocated_refund_amount,
-                    toDecimal64(0, 2)
-                ),
-                2
-            ) AS net_merchandise_revenue
-        FROM allocated
-    ),
-    costed AS (
-        SELECT
-            *,
-            toDecimal64(
-                if(
-                    is_successful_order = 1 AND net_merchandise_amount > 0,
-                    toFloat64(cogs_amount)
-                        * toFloat64(net_merchandise_revenue)
-                        / toFloat64(net_merchandise_amount),
-                    0
-                ),
-                2
-            ) AS recognized_cogs_amount
-        FROM netted
-    )
+WITH raw_lines AS (
+    SELECT
+        o.id AS order_id,
+        o.updated_at AS order_updated_at,
+        item
+    FROM bruin_shop.t1_orders AS o
+    ARRAY JOIN JSONExtractArrayRaw(ifNull(o.line_items, '[]')) AS item
+    WHERE o.updated_at BETWEEN
+        parseDateTime64BestEffort('{{ start_timestamp }}', 6, 'UTC')
+        AND parseDateTime64BestEffort('{{ end_timestamp }}', 6, 'UTC')
+),
+parsed AS (
+    SELECT
+        r.order_id,
+        r.order_updated_at,
+        JSONExtractInt(r.item, 'id') AS line_item_id,
+        toUInt64(JSONExtractInt(r.item, 'product_id')) AS product_legacy_id,
+        toUInt64(JSONExtractInt(r.item, 'variant_id')) AS variant_legacy_id,
+        JSONExtractString(r.item, 'sku') AS sku,
+        JSONExtractString(r.item, 'title') AS product_title,
+        JSONExtractString(r.item, 'variant_title') AS variant_title,
+        toLowCardinality(JSONExtractString(r.item, 'vendor')) AS vendor,
+        toInt64(JSONExtractInt(r.item, 'quantity')) AS quantity,
+        toInt64(JSONExtractInt(r.item, 'current_quantity')) AS current_quantity,
+        toDecimal64OrZero(JSONExtractString(r.item, 'price'), 2) AS unit_price,
+        toDecimal64OrZero(JSONExtractString(r.item, 'total_discount'), 2) AS discount_amount,
+        toBool(JSONExtractBool(r.item, 'requires_shipping')) AS requires_shipping,
+        toBool(JSONExtractBool(r.item, 'taxable')) AS taxable,
+        toBool(JSONExtractBool(r.item, 'gift_card')) AS is_gift_card
+    FROM raw_lines AS r
+),
+line_base AS (
+    SELECT
+        concat(toString(o.order_date), '|', toString(p.line_item_id)) AS line_item_key,
+        p.line_item_id,
+        p.order_id,
+        o.order_date,
+        o.order_month,
+        p.order_updated_at,
+        o.customer_id,
+        o.currency,
+        o.source_name,
+        if(
+            p.product_legacy_id = 0,
+            '',
+            concat('gid://shopify/Product/', toString(p.product_legacy_id))
+        ) AS product_id,
+        p.product_legacy_id,
+        p.variant_legacy_id,
+        p.sku,
+        p.product_title,
+        p.variant_title,
+        p.vendor,
+        p.quantity,
+        p.current_quantity,
+        p.unit_price,
+        toDecimal64(p.unit_price * p.quantity, 2) AS gross_sales_amount,
+        p.discount_amount,
+        toDecimal64((p.unit_price * p.quantity) - p.discount_amount, 2) AS net_line_amount,
+        o.current_subtotal_amount,
+        o.is_completed_order,
+        o.is_refunded_order,
+        p.requires_shipping,
+        p.taxable,
+        p.is_gift_card
+    FROM parsed AS p
+    INNER JOIN bruin_shop.t2_orders AS o
+        ON p.order_id = o.order_id
+),
+with_order_totals AS (
+    SELECT
+        lines.*,
+        sum(lines.net_line_amount) OVER (PARTITION BY lines.order_id) AS order_net_line_amount
+    FROM line_base AS lines
+)
 SELECT
-    line_item_id,
-    order_id,
-    order_date,
-    market_id,
-    market_index,
-    state,
-    city,
-    channel,
-    event_id,
-    campaign_id,
-    customer_id,
-    line_number,
-    product_id,
-    product_name,
-    product_category,
-    sku,
-    quantity,
-    unit_price,
-    gross_merchandise_amount,
-    discount_amount,
-    net_merchandise_amount AS line_net_merchandise_before_refund,
-    unit_cogs,
-    cogs_amount,
-    order_status,
-    financial_status,
-    fulfillment_status,
-    is_successful_order,
-    is_cancelled_order,
-    has_refund,
-    allocated_refund_amount,
-    net_merchandise_revenue,
-    recognized_cogs_amount,
-    toDecimal64(net_merchandise_revenue - recognized_cogs_amount, 2) AS gross_profit
-FROM costed
+    lines.line_item_key,
+    lines.line_item_id,
+    lines.order_id,
+    lines.order_date,
+    lines.order_month,
+    lines.order_updated_at,
+    lines.customer_id,
+    lines.currency,
+    lines.source_name,
+    lines.product_id,
+    lines.product_legacy_id,
+    lines.variant_legacy_id,
+    lines.sku,
+    lines.product_title,
+    lines.variant_title,
+    lines.vendor,
+    lines.quantity,
+    lines.current_quantity,
+    lines.unit_price,
+    lines.gross_sales_amount,
+    lines.discount_amount,
+    lines.net_line_amount,
+    if(
+        lines.is_completed_order = 1 AND lines.order_net_line_amount != 0,
+        toDecimal64(
+            toFloat64(lines.current_subtotal_amount)
+                * toFloat64(lines.net_line_amount)
+                / toFloat64(lines.order_net_line_amount),
+            2
+        ),
+        toDecimal64(0, 2)
+    ) AS recognized_line_revenue_amount,
+    lines.is_completed_order,
+    lines.is_refunded_order,
+    lines.requires_shipping,
+    lines.taxable,
+    lines.is_gift_card
+FROM with_order_totals AS lines
