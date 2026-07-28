@@ -1,7 +1,28 @@
 name: bruin-shop-clickhouse
-schedule: daily
-start_date: "2026-01-01"
+schedule: "@daily"
+start_date: "2006-01-01"
 catchup: false
 
 default_connections:
     clickhouse: "clickhouse-default"
+
+tags:
+    - clickhouse
+    - ecommerce
+    - shopify
+    - ingestr
+
+domains:
+    - commerce
+    - finance
+    - customer
+    - merchandising
+    - fulfillment
+
+meta:
+    description: "Live Shopify analytics warehouse ingested with ingestr and modeled in ClickHouse."
+    data_classification: mixed
+    source_mode: live-shopify
+    source_connection: shopify
+    reporting_timezone: UTC
+    currency_policy: no conversion; monetary aggregates remain at shop-currency grain
