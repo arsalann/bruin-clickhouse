@@ -1,73 +1,126 @@
-# Bruin ClickHouse 101
+# Bruin + ClickHouse feature showcase
 
-This is a small end-to-end Bruin pipeline for ClickHouse. It creates two raw demo tables, joins them into a customer-level summary, and publishes a country-level revenue mart.
+This pipeline is a compact tour of Bruin on ClickHouse. It combines SQL transformations, a Python materialization, versioned seed data, a PostgreSQL source and sensor, ingestr replication, lineage, governance metadata, quality checks, and a SQL unit test.
 
-## Pipeline Graph
+The deterministic core runs against the endpoint configured as **clickhouse-default**. The PostgreSQL branch uses **postgres-default** and is tagged **requires-postgres-default**.
 
-- `raw_customers`: static customer dimension data.
-- `raw_orders`: static order fact data.
-- `customer_order_summary`: joins customers to orders and calculates customer revenue metrics.
-- `country_revenue`: aggregates the customer summary into a final country revenue mart.
+## Pipeline at a glance
 
-## Setup
+~~~text
+Optional PostgreSQL branch
 
-You need a ClickHouse server and a Bruin `clickhouse-default` connection. You can run ClickHouse locally with Docker:
+pg.source -> pg.sensor.query -> ingestr -> ClickHouse view
 
-```bash
-docker run -d \
-  --name bruin-clickhouse-101 \
-  -e CLICKHOUSE_DB=default \
-  -e CLICKHOUSE_USER=username \
-  -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
-  -e CLICKHOUSE_PASSWORD=password \
-  -p 18123:8123 \
-  -p 19000:9000 \
-  --ulimit nofile=262144:262144 \
-  clickhouse/clickhouse-server
-```
+Deterministic ClickHouse core
 
-The repository includes `.bruin.yml.sample` with a matching local connection. You can copy it to `.bruin.yml`, or use it directly with `--config-file .bruin.yml.sample`.
+SQL raw assets + seed + Python asset
+  -> time_interval staging model
+  -> delete+insert customer mart
+  -> country revenue table and view
+  -> operational snapshot
+~~~
 
-```yaml
-default_environment: default
-environments:
-    default:
-        connections:
-            clickhouse:
-                - name: clickhouse-default
-                  username: username
-                  password: password
-                  host: 127.0.0.1
-                  port: 19000
-                  database: default
-```
+## Project layout
 
-## Running the Pipeline
+~~~text
+assets/
+├── materialization_types/  SQL examples for create+replace, time_interval,
+│                           delete+insert, append, truncate+insert, and view
+├── data_definitions/       CSV seed and explicit DDL definition
+├── python/                 Python materialization
+└── ingestion/              PostgreSQL source, sensor, ingestr, and monitor
+~~~
 
-Validate the pipeline:
+## Asset types and features
 
-```bash
-bruin validate bruin-clickhouse-101 --config-file .bruin.yml.sample
-```
+| Area | Example assets | Features demonstrated |
+| --- | --- | --- |
+| SQL materializations | materialization_types/raw_customers.sql, materialization_types/daily_order_snapshot.sql, materialization_types/country_revenue.sql | Table and view materialization; create+replace, time_interval, delete+insert, append, and truncate+insert strategies. |
+| Python and seed | python/customer_regions.py, data_definitions/country_targets.asset.yml | A Python function that returns rows and version-controlled CSV reference data with an enforced schema. |
+| Source and sensor | ingestion/postgres_orders_source.asset.yml, ingestion/postgres_orders_sensor.asset.yml | An external source definition and a readiness gate before ingestion. |
+| Ingestr | ingestion/raw_postgres_orders.asset.yml | Incremental PostgreSQL-to-ClickHouse replication using merge and an explicit high-water mark. |
+| DDL and physical layout | data_definitions/order_events_contract.sql | Explicit ClickHouse DDL with a partition key and composite ClickHouse sorting key. |
+| Governance | Most assets | Owners, tags, domains, metadata, column descriptions, and classification labels. |
+| Quality and testing | materialization_types/country_revenue.sql, materialization_types/customer_order_summary.sql | Built-in and custom quality checks, plus a mocked SQL unit test. |
+| Lineage | All dependent assets | Execution ordering and upstream/downstream inspection through bruin lineage. |
 
-Render the final mart SQL:
+## Connections
 
-```bash
-bruin render bruin-clickhouse-101/assets/country_revenue.sql --config-file .bruin.yml.sample
-```
+### ClickHouse Cloud
 
-Run the full pipeline:
+Keep your existing **.bruin.yml** and configure **clickhouse-default** for the intended Cloud service and database. The run commands work unchanged. Choose the appropriate Bruin environment and do not run a full refresh against production by default.
 
-```bash
-bruin run bruin-clickhouse-101/pipeline.yml --config-file .bruin.yml.sample
-```
+### Optional PostgreSQL branch
 
-Query the final table:
+Configure **postgres-default** before running the external-source path. Its source definition, sensor condition, and ingestion mapping live with the implementation in assets/ingestion/.
 
-```bash
-bruin query \
-  --config-file .bruin.yml.sample \
-  --connection clickhouse-default \
-  --query "select * from country_revenue order by total_paid_amount desc" \
-  --limit 10
-```
+## Run the pipeline
+
+The examples use **.bruin.yml**. Substitute another target configuration with `--config-file` when needed.
+
+Validate the showcase:
+
+~~~bash
+bruin validate bruin-clickhouse-101 \
+  --fast \
+  --config-file .bruin.yml
+~~~
+
+Run the complete showcase when both connections are configured. A full refresh rebuilds destination tables, so use an explicitly intended non-production environment:
+
+~~~bash
+bruin run bruin-clickhouse-101/pipeline.yml \
+  --config-file .bruin.yml \
+  --environment default \
+  --full-refresh \
+  --start-date 2024-04-01 \
+  --end-date 2024-04-15
+~~~
+
+If PostgreSQL is not available, bootstrap only the deterministic ClickHouse core:
+
+~~~bash
+bruin run bruin-clickhouse-101/pipeline.yml \
+  --config-file .bruin.yml \
+  --environment default \
+  --exclude-tag requires-postgres-default \
+  --full-refresh \
+  --start-date 2024-04-01 \
+  --end-date 2024-04-15
+~~~
+
+Run a normal incremental window and its downstream models:
+
+~~~bash
+bruin run bruin-clickhouse-101/assets/materialization_types/daily_order_snapshot.sql \
+  --downstream \
+  --config-file .bruin.yml \
+  --environment default \
+  --start-date 2024-04-16 \
+  --end-date 2024-04-30
+~~~
+
+Run data-quality checks without rebuilding the model:
+
+~~~bash
+bruin run bruin-clickhouse-101/assets/materialization_types/country_revenue.sql \
+  --only checks \
+  --config-file .bruin.yml \
+  --environment default
+~~~
+
+Run the SQL unit test:
+
+~~~bash
+bruin unit-test bruin-clickhouse-101/assets/materialization_types/country_revenue.sql \
+  --environment default
+~~~
+
+The unit-test command resolves its connection from `.bruin.yml` and does not accept `--config-file`.
+
+Inspect the deterministic-core and PostgreSQL lineage branches:
+
+~~~bash
+bruin lineage bruin-clickhouse-101/assets/materialization_types/country_revenue.sql --full
+bruin lineage bruin-clickhouse-101/assets/ingestion/postgres_order_daily_monitor.sql --full
+~~~
