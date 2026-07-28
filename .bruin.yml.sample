@@ -4,11 +4,21 @@ environments:
         connections:
             clickhouse:
                 - name: clickhouse-default
-                  username: username
-                  password: password
-                  host: 127.0.0.1
-                  port: 19000
+                  username: ${CLICKHOUSE_USERNAME}
+                  password: ${CLICKHOUSE_PASSWORD}
+                  host: ${CLICKHOUSE_HOST}
+                  port: 9440
+                  http_port: 8443
                   database: default
+                  secure: 1
+            postgres:
+                - name: postgres-default
+                  username: ${POSTGRES_USERNAME}
+                  password: ${POSTGRES_PASSWORD}
+                  host: ${POSTGRES_HOST}
+                  port: ${POSTGRES_PORT}
+                  database: ${POSTGRES_DATABASE}
+                  ssl_mode: ${POSTGRES_SSL_MODE}
             github:
                 - name: github
                   access_token: ${GITHUB_TOKEN}
