@@ -233,3 +233,9 @@ logs/queries
 logs/runs
 *.py[cod]
 logs/*.log
+
+# The Bruin CLI writes a .gitignore next to any config file it loads, to keep real
+# credentials out of version control. bruin-payments-clickhouse/docker/bruin-local.yml
+# holds only throwaway local Docker credentials and is tracked on purpose, so the
+# generated file is ignored rather than committed.
+bruin-payments-clickhouse/docker/.gitignore
