@@ -21,7 +21,8 @@ The payments pipeline is self-contained: it brings up its own PostgreSQL source 
 
 ```bash
 docker compose -f bruin-payments-clickhouse/docker/compose.yml up -d
-bruin validate bruin-payments-clickhouse --config-file bruin-payments-clickhouse/docker/bruin-local.yml
+./bruin-payments-clickhouse/run-demo.sh 30
+dac serve --dir bruin-payments-clickhouse --config bruin-payments-clickhouse/docker/bruin-local.yml --open
 ```
 
 See `bruin-clickhouse-101/README.md` for the feature map, materialization behavior, and the optional PostgreSQL ingestion setup, and `bruin-payments-clickhouse/README.md` for the change-capture and lookback story.

@@ -1,13 +1,13 @@
 # Bruin Payments ClickHouse
 
-Near-real-time payments authorization and fraud monitoring, built on the pattern
+Near-real-time payments authorization and fraud monitoring, built around the pattern
 ClickHouse is best at: an operational PostgreSQL database is the system of record, its
 changes are captured into ClickHouse, and Bruin folds them into pre-aggregated serving
 tables that a Dashboard-as-Code dashboard reads. The pipeline is scheduled every minute,
 so the dashboard trails the source by about a minute.
 
-Everything here runs end to end from a clean checkout against two Docker containers. No
-cloud account, no credentials to fill in.
+It runs end to end from a clean checkout against two Docker containers. No cloud account,
+no credentials to fill in.
 
 | | |
 |---|---|
@@ -18,15 +18,129 @@ cloud account, no credentials to fill in.
 | Timezone | UTC throughout |
 | Fraud labels | supplied by the source and monitored, never modelled |
 
-## How it compares to the other pipelines here
+---
 
-| | `bruin-clickhouse-101` | `bruin-shop-clickhouse` | **this pipeline** |
-|---|---|---|---|
-| Source | Postgres + seeds | Shopify API | **PostgreSQL OLTP, change capture** |
-| Cadence | daily | daily | **every minute** |
-| Pattern | feature tour | medallion warehouse | **change log → rollup cascade → serving → dashboard** |
-| Consumer | learners | analysts | **operations and risk, live** |
-| Vertical | generic | commerce | **fintech payments** |
+## Quick start
+
+Three commands. About three minutes end to end, most of it the demo replay.
+
+### 1. Start PostgreSQL and ClickHouse
+
+```bash
+docker compose -f bruin-payments-clickhouse/docker/compose.yml up -d
+```
+
+Wait until both report healthy:
+
+```bash
+docker compose -f bruin-payments-clickhouse/docker/compose.yml ps
+```
+
+### 2. Generate and process some traffic
+
+```bash
+./bruin-payments-clickhouse/run-demo.sh 30
+```
+
+This replays the pipeline as if it had been on its one-minute schedule for the last 30
+minutes, plus a short block on the previous UTC day so both halves of the serving view
+have data. The argument is the number of live-day minutes; 30 is a good default and took
+2m15s on a laptop.
+
+It prints a summary when it finishes:
+
+```text
+==> Result
+┌────────────────────────────────────────────┬───────────────────────────────┬────────────────┬───────────────┬─────────────────────┬───────────────────────────────┐
+│ SOURCE                                     │ FROM_DATE                     │ AUTHORIZATIONS │ APPROVAL_RATE │ APPROVED_VOLUME_USD │ UNIQUE_CARDS                  │
+├────────────────────────────────────────────┼───────────────────────────────┼────────────────┼───────────────┼─────────────────────┼───────────────────────────────┤
+│ earlier (sealed, from the daily KPI table) │ 2026-08-23 00:00:00 +0000 UTC │ 447            │ 0.7852        │ 58138.9             │ available                     │
+│ today (live, from the minute rollup)       │ 2026-08-24 00:00:00 +0000 UTC │ 1208           │ 0.7897        │ 143891.17           │ not additive - null by design │
+└────────────────────────────────────────────┴───────────────────────────────┴────────────────┴───────────────┴─────────────────────┴───────────────────────────────┘
+```
+
+Those two rows are the whole architecture in miniature: today is served live from the
+per-minute rollup, earlier days from the sealed daily table, and the non-additive KPIs
+exist only on the sealed side. Exact numbers vary with the traffic you generate.
+
+### 3. Open the dashboard
+
+```bash
+dac serve --dir bruin-payments-clickhouse \
+  --config bruin-payments-clickhouse/docker/bruin-local.yml \
+  --open
+```
+
+Defaults to <http://localhost:8321>. If that port is busy, DAC silently moves to the next
+free one, so check the line it prints:
+
+```text
+dac server listening on http://127.0.0.1:8323
+```
+
+### Tear down
+
+```bash
+docker compose -f bruin-payments-clickhouse/docker/compose.yml down -v
+```
+
+---
+
+## Running it by hand
+
+`run-demo.sh` is a loop around one command. To drive it yourself:
+
+```bash
+CFG=bruin-payments-clickhouse/docker/bruin-local.yml
+
+bruin run bruin-payments-clickhouse/pipeline.yml \
+  --config-file $CFG \
+  --apply-interval-modifiers \
+  --start-date "2026-08-24 11:00:00" \
+  --end-date   "2026-08-24 11:00:59.999999"
+```
+
+Four things matter:
+
+1. **The first run of a fresh warehouse needs `--full-refresh`.** `rollup_txn_1m` uses the
+   `time_interval` strategy, whose delete statement runs before the table exists.
+2. **Windows must be whole UTC minutes**, matching the schedule. A window that starts
+   mid-minute would leave a partial duplicate of the boundary minute — there is a blocking
+   check for exactly that.
+3. **Run windows in chronological order.** Restatements reference the three preceding
+   windows, so replaying out of order turns them into late-arriving inserts instead of
+   updates.
+4. **`--apply-interval-modifiers` is not optional.** Without it Bruin uses the interval as
+   given and the `interval_modifiers` on the rollup and KPI assets are ignored
+   **silently** — the run still succeeds, and late restatements are simply never folded
+   in. On a schedule, Bruin Cloud computes the interval and applies the modifiers itself,
+   so a scheduled run needs no flag.
+
+All commands pass `--config-file bruin-payments-clickhouse/docker/bruin-local.yml`, a
+committed config pointing at the containers. Its credentials are local-only demo values,
+not secrets. To run against ClickHouse Cloud instead, use your own `.bruin.yml` and drop
+the flag.
+
+> The Bruin CLI writes a `.gitignore` next to any config file it loads, so
+> `docker/.gitignore` reappears after every command and lists `bruin-local.yml`. That file
+> is tracked deliberately; the repository's root `.gitignore` ignores the generated one. If
+> you ever need to re-add the config, `git add -f` it.
+
+### Other useful commands
+
+```bash
+CFG=bruin-payments-clickhouse/docker/bruin-local.yml
+
+bruin validate bruin-payments-clickhouse --config-file $CFG
+bruin run bruin-payments-clickhouse/pipeline.yml --config-file $CFG --only checks
+bruin lineage bruin-payments-clickhouse/assets/serving/serving_realtime_risk.sql --full
+
+# validate the dashboard, and execute every widget query without a browser
+dac validate --dir bruin-payments-clickhouse --config $CFG
+dac check    --dir bruin-payments-clickhouse --config $CFG
+```
+
+---
 
 ## Architecture
 
@@ -56,10 +170,8 @@ rollup_txn_1h                  kpi_txn_daily  ← additive measures summed from 
 bruin_payments.serving_realtime_risk        ← view: today live ∪ sealed history + derived rates
      │
      ▼
-dashboards/payments_risk.yml + semantic/payments_risk.yml  →  localhost:8321
+dashboards/payments_risk.yml + semantic/payments_risk.yml  →  dac serve
 ```
-
-### The assets
 
 | Asset | Type | Strategy | What it is for |
 |---|---|---|---|
@@ -71,86 +183,17 @@ dashboards/payments_risk.yml + semantic/payments_risk.yml  →  localhost:8321
 | `bruin_payments.kpi_txn_daily` | SQL | `merge` + 3h lookback | Daily KPIs; where additivity stops being free |
 | `bruin_payments.serving_realtime_risk` | SQL view | — | One dashboard-ready object over all history |
 
-## Run it
+### How it compares to the other pipelines here
 
-### 1. Start the source and destination
+| | `bruin-clickhouse-101` | `bruin-shop-clickhouse` | **this pipeline** |
+|---|---|---|---|
+| Source | Postgres + seeds | Shopify API | **PostgreSQL OLTP, change capture** |
+| Cadence | daily | daily | **every minute** |
+| Pattern | feature tour | medallion warehouse | **change log → rollup cascade → serving → dashboard** |
+| Consumer | learners | analysts | **operations and risk, live** |
+| Vertical | generic | commerce | **fintech payments** |
 
-```bash
-docker compose -f bruin-payments-clickhouse/docker/compose.yml up -d
-```
-
-PostgreSQL comes up with `wal_level=logical`, `REPLICA IDENTITY FULL` and a publication
-on `payments.transactions` — the documented prerequisites for log-based CDC — plus the
-table itself. Nothing in the pipeline creates the source table; a payments processor
-would already own it.
-
-All commands below pass `--config-file bruin-payments-clickhouse/docker/bruin-local.yml`,
-a committed config pointing at those containers. Its credentials are local-only demo
-values, not secrets. To run against ClickHouse Cloud instead, use your own `.bruin.yml`
-and drop the flag.
-
-> The Bruin CLI writes a `.gitignore` next to any config file it loads, so
-> `docker/.gitignore` reappears after every command and lists `bruin-local.yml`. That
-> file is tracked deliberately — the repository's root `.gitignore` ignores the generated
-> one. If you ever need to re-add the config, `git add -f` it.
-
-### 2. Bootstrap
-
-The first run must be a full refresh. `rollup_txn_1m` uses the `time_interval` strategy,
-whose delete statement precedes table creation, so it needs one run that creates its
-target first.
-
-```bash
-bruin run bruin-payments-clickhouse/pipeline.yml \
-  --config-file bruin-payments-clickhouse/docker/bruin-local.yml \
-  --full-refresh --apply-interval-modifiers \
-  --start-date "2026-08-18 09:00:00" \
-  --end-date   "2026-08-18 09:00:59.999999"
-```
-
-### 3. Run consecutive minutes
-
-Restatements reference the three preceding windows, so run **consecutive** minutes to see
-the lifecycle and the lookback do their work. Windows spaced further apart still run, but
-every restatement lands as a late-arriving insert rather than an update.
-
-```bash
-for m in $(seq -w 1 25); do
-  bruin run bruin-payments-clickhouse/pipeline.yml \
-    --config-file bruin-payments-clickhouse/docker/bruin-local.yml \
-    --apply-interval-modifiers \
-    --start-date "2026-08-18 09:$m:00" \
-    --end-date   "2026-08-18 09:$m:59.999999"
-done
-```
-
-> `--apply-interval-modifiers` is not optional. Without it, Bruin uses the interval as
-> given and the `interval_modifiers` on the rollup and KPI assets are ignored **silently**
-> — the pipeline still succeeds, and late restatements are simply never folded in.
-
-On a schedule, Bruin Cloud computes the interval and applies the modifiers itself, so a
-scheduled run needs no flag.
-
-### 4. Serve the dashboard
-
-```bash
-dac serve --dir bruin-payments-clickhouse \
-  --config bruin-payments-clickhouse/docker/bruin-local.yml \
-  --port 8321 --open
-```
-
-Validate the definitions, or execute every widget query without a browser:
-
-```bash
-dac validate --dir bruin-payments-clickhouse --config bruin-payments-clickhouse/docker/bruin-local.yml
-dac check    --dir bruin-payments-clickhouse --config bruin-payments-clickhouse/docker/bruin-local.yml
-```
-
-### 5. Tear down
-
-```bash
-docker compose -f bruin-payments-clickhouse/docker/compose.yml down -v
-```
+---
 
 ## Tuning the demo traffic
 
@@ -166,23 +209,26 @@ docker compose -f bruin-payments-clickhouse/docker/compose.yml down -v
 ```bash
 bruin run bruin-payments-clickhouse/pipeline.yml \
   --config-file bruin-payments-clickhouse/docker/bruin-local.yml \
-  --apply-interval-modifiers --var txns_per_minute=200
+  --apply-interval-modifiers --var txns_per_minute=200 \
+  --start-date "2026-08-24 11:00:00" --end-date "2026-08-24 11:00:59.999999"
 ```
 
 Every generated row is a pure function of `(window_start_epoch, row_index)`, so the seed
 is idempotent: rerunning a window reproduces byte-identical transactions rather than
 inventing new ones.
 
+---
+
 ## The two ideas worth taking away
 
-### 1. Late-arriving restatements, and what a lookback window actually buys
+### 1. Late-arriving restatements, and what a lookback window buys
 
-A payment is not immutable. An authorization is approved, then refunded days later, then
-charged back. Each transition bumps `updated_at` in PostgreSQL, so the capture picks it up
-in a *later* run than the one that first recorded the transaction — but the metric has to
+A payment is not immutable. An authorization is approved, then refunded, then charged
+back. Each transition bumps `updated_at` in PostgreSQL, so capture picks it up in a
+*later* run than the one that first recorded the transaction — but the metric has to
 change in the minute the authorization *happened*, not the minute the chargeback arrived.
 
-That is why every rollup buckets on `created_at` and never on `updated_at`, and why
+That is why every rollup buckets on `created_at`, never on `updated_at`, and why
 `rollup_txn_1m` declares:
 
 ```yaml
@@ -191,25 +237,52 @@ interval_modifiers:
 ```
 
 Each run reprocesses the previous 15 minutes, so a restatement rewrites the minute it
-belongs to. Watch it happen:
+belongs to. To watch it happen, find a transaction that went the whole way:
 
-```sql
--- a transaction that moved through all three states
-SELECT transaction_id, arrayStringConcat(groupArray(status), ' -> ') AS lifecycle
-FROM (
-    SELECT DISTINCT transaction_id, status, updated_at
-    FROM bruin_payments.stg_transaction_changes
-    ORDER BY transaction_id, updated_at
+```bash
+bruin query --config-file bruin-payments-clickhouse/docker/bruin-local.yml \
+  --connection clickhouse-default --query "
+WITH lifecycle AS (
+    SELECT transaction_id, arrayStringConcat(groupArray(status), ' -> ') AS states
+    FROM (SELECT DISTINCT transaction_id, status, updated_at
+          FROM bruin_payments.stg_transaction_changes
+          ORDER BY transaction_id, updated_at)
+    GROUP BY transaction_id
+    HAVING count() = 3
+    LIMIT 1
+),
+authorization AS (
+    SELECT DISTINCT c.transaction_id, c.created_at, c.merchant_category, c.card_network, c.country
+    FROM bruin_payments.stg_transaction_changes AS c
+    INNER JOIN lifecycle AS l ON c.transaction_id = l.transaction_id
+    LIMIT 1
 )
-GROUP BY transaction_id
-HAVING count() = 3
-LIMIT 1
+SELECT a.transaction_id, l.states, a.created_at AS authorized_at,
+       r.txn_minute, r.txns, r.approved, r.refunded, r.chargebacks
+FROM authorization AS a
+CROSS JOIN lifecycle AS l
+INNER JOIN bruin_payments.rollup_txn_1m AS r
+    ON r.txn_minute = toDateTime64(toStartOfMinute(a.created_at), 3, 'UTC')
+   AND r.merchant_category = a.merchant_category
+   AND r.card_network = a.card_network
+   AND r.country = a.country"
 ```
 
-In a verified run, transaction `178704372000014` was authorized at `09:02:35` and charged
-back at `09:05:09`. Minute `09:02` had been written three minutes earlier showing
-`approved = 1`; after the lookback run it reads `approved = 0, chargebacks = 1`. The
-sealed minute was corrected in place.
+In one verified run this returned:
+
+```text
+┌──────────────────┬────────────────────────────────────┬───────────────────────────────────┬───────────────────────────────┬──────┬──────────┬──────────┬─────────────┐
+│ A.TRANSACTION_ID │ STATES                             │ AUTHORIZED_AT                     │ TXN_MINUTE                    │ TXNS │ APPROVED │ REFUNDED │ CHARGEBACKS │
+├──────────────────┼────────────────────────────────────┼───────────────────────────────────┼───────────────────────────────┼──────┼──────────┼──────────┼─────────────┤
+│ 178756968000009  │ approved -> refunded -> chargeback │ 2026-08-24 11:08:20.411 +0000 UTC │ 2026-08-24 11:08:00 +0000 UTC │ 1    │ 0        │ 0        │ 1           │
+└──────────────────┴────────────────────────────────────┴───────────────────────────────────┴───────────────────────────────┴──────┴──────────┴──────────┴─────────────┘
+```
+
+Minute `11:08` was written to the rollup while that payment was still `approved`. Two runs
+later the chargeback arrived, the lookback reprocessed the minute, and it now reads
+`approved = 0, chargebacks = 1`. The sealed minute was corrected in place, and the
+chargeback is attributed to the minute the payment was authorized rather than the minute
+the chargeback landed.
 
 The lookback is the entire correctness budget, and it is a real trade-off. 15 minutes at
 minute grain means a restatement arriving 20 minutes late is **never** reflected. Widen
@@ -223,23 +296,50 @@ latency *sum*. `rollup_txn_1h` and the additive half of `kpi_txn_daily` are ther
 plain `sum()` queries over the minute grain — which is the whole reason a rollup cascade
 is cheap.
 
-Unique cards and P95 latency do not survive it. From a verified 29-minute run:
+Unique cards and P95 latency do not survive it. Compare a naive rollup against the truth
+for the sealed day:
 
-| Measure | Rolled up naively | Truth | Error |
-|---|---|---|---|
-| Unique active cards | 1,043 | 932 | +11.9% |
-| P95 auth latency | 397 ms | 121 ms | +228% |
+```bash
+bruin query --config-file bruin-payments-clickhouse/docker/bruin-local.yml \
+  --connection clickhouse-default --query "
+SELECT
+    (SELECT sum(unique_cards) FROM bruin_payments.kpi_txn_daily
+     WHERE txn_date = toDate(now('UTC')) - 1)                       AS naive_sum_of_groups,
+    (SELECT uniqExact(card_id) FROM bruin_payments.stg_transaction_changes
+     WHERE toDate(created_at) = toDate(now('UTC')) - 1)             AS true_unique_cards,
+    (SELECT max(p95_auth_latency_ms) FROM bruin_payments.kpi_txn_daily
+     WHERE txn_date = toDate(now('UTC')) - 1)                       AS naive_max_of_group_p95,
+    (SELECT toUInt32(quantileExact(0.95)(auth_latency_ms))
+     FROM bruin_payments.stg_transaction_changes
+     WHERE toDate(created_at) = toDate(now('UTC')) - 1)             AS true_p95"
+```
+
+One run of the 10-minute history block returned:
+
+```text
+┌─────────────────────┬───────────────────┬────────────────────────┬──────────┐
+│ NAIVE_SUM_OF_GROUPS │ TRUE_UNIQUE_CARDS │ NAIVE_MAX_OF_GROUP_P95 │ TRUE_P95 │
+├─────────────────────┼───────────────────┼────────────────────────┼──────────┤
+│ 447                 │ 427               │ 355                    │ 131      │
+└─────────────────────┴───────────────────┴────────────────────────┴──────────┘
+```
+
+Cards overstated by 4.7%, P95 by 171%. The gap widens with the number of dimension groups,
+because a card used in two groups is counted twice, and a maximum-of-quantiles reports the
+worst small group rather than the 95th percentile of anything.
 
 So `kpi_txn_daily` re-reads the change log for exactly those two columns, and
-`serving_realtime_risk` returns `NULL` for both on the current day rather than a
-plausible wrong number. The dashboard's P95 tile pays the cost in the open, re-deriving
-the quantile on every render.
+`serving_realtime_risk` returns `NULL` for both on the current day rather than a plausible
+wrong number. The dashboard's P95 tile pays the cost in the open, re-deriving the quantile
+on every render.
 
 Making them additive requires storing aggregate *state* rather than values —
-`uniqState`, `quantileState` on an `AggregatingMergeTree` — which Bruin does not expose
-as a first-class strategy today, and which brings a genuinely harder correctness problem
+`uniqState`, `quantileState` on an `AggregatingMergeTree` — which Bruin does not expose as
+a first-class strategy today, and which brings a genuinely harder correctness problem
 under restatements. That analysis is in
 [docs/mode2-aggregating-mergetree.md](docs/mode2-aggregating-mergetree.md).
+
+---
 
 ## Reading the change log correctly
 
@@ -272,28 +372,12 @@ FROM bruin_payments.raw_transaction_changes
 
 A `--full-refresh` over the full history clears them.
 
-## Deviations from the original requirements
-
-Four things in the requirements document turned out not to be buildable as specified. Each
-was verified against the running toolchain rather than assumed, and
-[docs/ingestion-boundaries.md](docs/ingestion-boundaries.md) has the reproductions.
-
-| Specified | Built | Why |
-|---|---|---|
-| Log-based CDC (`postgres+cdc://`, batch mode) | Cursor-based capture on `updated_at` | ingestr refuses ClickHouse as a managed-CDC destination: *"destination scheme "clickhouse" cannot safely run managed CDC"*. The same source works into DuckDB. Hard `DELETE`s are consequently not captured. |
-| `merge` into a `ReplacingMergeTree`, deduplicated on `transaction_id` | `append` into a `MergeTree`, collapsed with `argMax` at read time | ingestr's ClickHouse merge reported 927 rows loaded and persisted 1. Read-time collapse is also the canonical ClickHouse pattern for mutable sources. |
-| `amount numeric(18,2)` | `amount_cents bigint` | Schema evolution fails on every incremental run after the first: *"decimal widening requires precision 40"*. Integer minor units are also how card processors actually store money, so every rollup sum is exact. |
-| `--exclude-tag requires-postgres-cdc` runs fully offline | The whole pipeline needs PostgreSQL; Docker makes it local | The seed writes to PostgreSQL as the system of record, so change capture is the only path into ClickHouse. "Offline" here means no cloud, not no database. Live-source assets are tagged `requires-postgres`; the generator is tagged `demo-seed` so `--exclude-tag demo-seed` points the pipeline at a real source. |
-
-One asset was added that the requirements did not call for:
-`stg_transaction_changes`. Ingestion infers every column as `Nullable`, and ClickHouse
-refuses a nullable sorting key, so the conformance has to happen somewhere. Doing it once
-in a view beats repeating `ifNull` in every rollup.
+---
 
 ## Governance
 
 Every asset declares an owner, layer and domain tags, grain and freshness metadata, and a
-description for every column. Blocking checks cover:
+description for every column. 81 checks run across the pipeline. Blocking ones cover:
 
 - primary-key nullability and uniqueness on both merge-keyed tables;
 - each captured version being internally self-consistent;
@@ -313,23 +397,62 @@ bruin run bruin-payments-clickhouse/pipeline.yml \
   --config-file bruin-payments-clickhouse/docker/bruin-local.yml --only checks
 ```
 
-## Useful queries
+Verify the grains agree:
 
 ```bash
-CFG=bruin-payments-clickhouse/docker/bruin-local.yml
-
-# grains reconcile
-bruin query --config-file $CFG --connection clickhouse-default --query "
-SELECT 'minute' AS grain, sum(txns) FROM bruin_payments.rollup_txn_1m
-UNION ALL SELECT 'hour', sum(txns) FROM bruin_payments.rollup_txn_1h
-UNION ALL SELECT 'day',  sum(txns) FROM bruin_payments.kpi_txn_daily"
-
-# what the dashboard reads
-bruin query --config-file $CFG --connection clickhouse-default --query "
-SELECT is_today, sum(txns) AS txns, round(sum(approved)/sum(txns), 4) AS approval_rate,
-       sum(approved_volume) AS volume_usd
-FROM bruin_payments.serving_realtime_risk GROUP BY is_today"
-
-# lineage
-bruin lineage bruin-payments-clickhouse/assets/serving/serving_realtime_risk.sql --full
+bruin query --config-file bruin-payments-clickhouse/docker/bruin-local.yml \
+  --connection clickhouse-default --query "
+SELECT 'changelog' AS grain, uniqExact(transaction_id) AS n FROM bruin_payments.stg_transaction_changes
+UNION ALL SELECT 'minute',  sum(txns) FROM bruin_payments.rollup_txn_1m
+UNION ALL SELECT 'hour',    sum(txns) FROM bruin_payments.rollup_txn_1h
+UNION ALL SELECT 'day',     sum(txns) FROM bruin_payments.kpi_txn_daily
+UNION ALL SELECT 'serving', sum(txns) FROM bruin_payments.serving_realtime_risk"
 ```
+
+All five numbers should be identical.
+
+---
+
+## Deviations from the original requirements
+
+Four things in the requirements document turned out not to be buildable as specified. Each
+was verified against the running toolchain rather than assumed;
+[docs/ingestion-boundaries.md](docs/ingestion-boundaries.md) has the reproductions.
+
+| Specified | Built | Why |
+|---|---|---|
+| Log-based CDC (`postgres+cdc://`, batch mode) | Cursor-based capture on `updated_at` | ingestr refuses ClickHouse as a managed-CDC destination: *"destination scheme "clickhouse" cannot safely run managed CDC"*. The same source works into DuckDB. Hard `DELETE`s are consequently not captured. |
+| `merge` into a `ReplacingMergeTree`, deduplicated on `transaction_id` | `append` into a `MergeTree`, collapsed with `argMax` at read time | ingestr's ClickHouse merge reported 927 rows loaded and persisted 1. Read-time collapse is also the canonical ClickHouse pattern for mutable sources. |
+| `amount numeric(18,2)` | `amount_cents bigint` | Schema evolution fails on every incremental run after the first: *"decimal widening requires precision 40"*. Integer minor units are also how card processors actually store money, so every rollup sum is exact. |
+| `--exclude-tag requires-postgres-cdc` runs fully offline | The whole pipeline needs PostgreSQL; Docker makes it local | The seed writes to PostgreSQL as the system of record, so change capture is the only path into ClickHouse. "Offline" here means no cloud, not no database. Live-source assets are tagged `requires-postgres`; the generator is tagged `demo-seed`, so `--exclude-tag demo-seed` points the pipeline at a real source. |
+
+One asset was added that the requirements did not call for:
+`stg_transaction_changes`. Ingestion infers every column as `Nullable`, and ClickHouse
+refuses a nullable sorting key, so the conformance has to happen somewhere. Doing it once
+in a view beats repeating `ifNull` in every rollup.
+
+There are no unit tests. `bruin unit-test` casts only the first mocked input row and emits
+later rows as untyped string literals, so a multi-row fixture with timestamp columns —
+exactly what testing the version-collapse needs — cannot be expressed. Shipping a failing
+test seemed worse than saying so here.
+
+## Known cosmetic quirks
+
+- **Dips at the start of each replayed block.** The seed restates transactions from the
+  three windows *before* the one it is running, so the first few minutes of a block contain
+  only late arrivals — a handful of transactions, or none at all. On a real one-minute
+  schedule this does not happen, because there is always a preceding window. The x-axis is
+  a category of minute labels, so a minute with no rows closes up rather than leaving a
+  hole, and the line dips to zero and recovers. `run-demo.sh` replays two disjoint blocks,
+  so there are two such dips.
+
+  To see it: the leading minutes carry 1 and 3 authorizations before the rate settles at
+  `txns_per_minute`.
+
+  ```sql
+  SELECT txn_minute, sum(txns) AS txns
+  FROM bruin_payments.rollup_txn_1m
+  GROUP BY txn_minute ORDER BY txn_minute LIMIT 8
+  ```
+- **The P95 tile is a tall, mostly empty card.** A metric widget stretches to the height of
+  the chart beside it.
