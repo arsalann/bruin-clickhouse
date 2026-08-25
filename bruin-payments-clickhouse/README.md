@@ -22,40 +22,25 @@ no credentials to fill in.
 
 ## Quick start
 
-Three commands. About three minutes end to end, most of it the demo replay.
-
-### 1. Start PostgreSQL and ClickHouse
-
-```bash
-docker compose -f bruin-payments-clickhouse/docker/compose.yml up -d
-```
-
-Wait until both report healthy:
+One command. It starts the containers, waits for them, replays 30 minutes of traffic
+through the pipeline, and opens the dashboard.
 
 ```bash
-docker compose -f bruin-payments-clickhouse/docker/compose.yml ps
+./bruin-payments-clickhouse/demo.sh
 ```
 
-### 2. Generate and process some traffic
+About three minutes, most of it the replay. Pass a different number of minutes as an
+argument: `./bruin-payments-clickhouse/demo.sh up 60`.
 
-```bash
-./bruin-payments-clickhouse/run-demo.sh 30
-```
-
-This replays the pipeline as if it had been on its one-minute schedule for the last 30
-minutes, plus a short block on the previous UTC day so both halves of the serving view
-have data. The argument is the number of live-day minutes; 30 is a good default and took
-2m15s on a laptop.
-
-It prints a summary when it finishes:
+Before the dashboard opens it prints what you are about to look at:
 
 ```text
-==> Result
+==> What the dashboard will show
 ┌────────────────────────────────────────────┬───────────────────────────────┬────────────────┬───────────────┬─────────────────────┬───────────────────────────────┐
 │ SOURCE                                     │ FROM_DATE                     │ AUTHORIZATIONS │ APPROVAL_RATE │ APPROVED_VOLUME_USD │ UNIQUE_CARDS                  │
 ├────────────────────────────────────────────┼───────────────────────────────┼────────────────┼───────────────┼─────────────────────┼───────────────────────────────┤
-│ earlier (sealed, from the daily KPI table) │ 2026-08-23 00:00:00 +0000 UTC │ 447            │ 0.7852        │ 58138.9             │ available                     │
-│ today (live, from the minute rollup)       │ 2026-08-24 00:00:00 +0000 UTC │ 1208           │ 0.7897        │ 143891.17           │ not additive - null by design │
+│ earlier (sealed, from the daily KPI table) │ 2026-08-24 00:00:00 +0000 UTC │ 442            │ 0.7873        │ 57003.31            │ available                     │
+│ today (live, from the minute rollup)       │ 2026-08-25 00:00:00 +0000 UTC │ 802            │ 0.7855        │ 105294.98           │ not additive - null by design │
 └────────────────────────────────────────────┴───────────────────────────────┴────────────────┴───────────────┴─────────────────────┴───────────────────────────────┘
 ```
 
@@ -63,32 +48,28 @@ Those two rows are the whole architecture in miniature: today is served live fro
 per-minute rollup, earlier days from the sealed daily table, and the non-additive KPIs
 exist only on the sealed side. Exact numbers vary with the traffic you generate.
 
-### 3. Open the dashboard
+The dashboard comes up on <http://localhost:8321>. If that port is busy, DAC moves to the
+next free one, so check the URL it prints.
 
-```bash
-dac serve --dir bruin-payments-clickhouse \
-  --config bruin-payments-clickhouse/docker/bruin-local.yml \
-  --open
-```
+### The other subcommands
 
-Defaults to <http://localhost:8321>. If that port is busy, DAC silently moves to the next
-free one, so check the line it prints:
+| Command | What it does |
+|---|---|
+| `demo.sh` or `demo.sh up [minutes]` | Everything: start containers, replay, serve |
+| `demo.sh replay [minutes]` | Replay only — containers already running, no dashboard |
+| `demo.sh serve` | Dashboard only |
+| `demo.sh status` | What is running, and what is in the warehouse |
+| `demo.sh down` | Stop and delete the containers and their data |
+| `demo.sh --help` | The same list |
 
-```text
-dac server listening on http://127.0.0.1:8323
-```
-
-### Tear down
-
-```bash
-docker compose -f bruin-payments-clickhouse/docker/compose.yml down -v
-```
+It needs `docker`, `bruin` and `python3` on `PATH`, plus `dac` for the dashboard, and it
+checks for them before doing anything.
 
 ---
 
 ## Running it by hand
 
-`run-demo.sh` is a loop around one command. To drive it yourself:
+`demo.sh replay` is a loop around one command. To drive it yourself:
 
 ```bash
 CFG=bruin-payments-clickhouse/docker/bruin-local.yml
@@ -443,7 +424,7 @@ test seemed worse than saying so here.
   only late arrivals — a handful of transactions, or none at all. On a real one-minute
   schedule this does not happen, because there is always a preceding window. The x-axis is
   a category of minute labels, so a minute with no rows closes up rather than leaving a
-  hole, and the line dips to zero and recovers. `run-demo.sh` replays two disjoint blocks,
+  hole, and the line dips to zero and recovers. `demo.sh` replays two disjoint blocks,
   so there are two such dips.
 
   To see it: the leading minutes carry 1 and 3 authorizations before the rate settles at
